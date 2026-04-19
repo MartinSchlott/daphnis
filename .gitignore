@@ -1,0 +1,15 @@
+.claude/commands/cortex-md.md
+.claude/skills/documentation-philosophy/SKILL.md
+.claude/skills/react-guidelines/SKILL.md
+.claude/skills/typescript-guidelines/SKILL.md
+AGENTS.md
+CLAUDE.md
+
+node_modules/
+dist/
+coverage/
+*.log
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*

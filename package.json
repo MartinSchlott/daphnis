@@ -1,0 +1,37 @@
+{
+  "name": "@ai-inquisitor/daphnis",
+  "version": "1.0.0",
+  "description": "Thin, provider-agnostic TypeScript wrapper for the Claude CLI and OpenAI Codex CLI.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "author": "Martin Schlott",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MartinSchlott/daphnis.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MartinSchlott/daphnis/issues"
+  },
+  "homepage": "https://github.com/MartinSchlott/daphnis#readme",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.0.5"
+  }
+}
