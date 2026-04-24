@@ -23,6 +23,7 @@ daphnis/
 │   ├── codex-cli-wrapper.ts  # persistent Codex session (JSON-RPC app-server)
 │   ├── one-shot.ts           # runOneShotPrompt for both providers
 │   ├── sessions.ts           # listSessions + loadSessionHistory
+│   ├── registry.ts           # listInstances, getInstance, meta slot
 │   ├── effort-mapping.ts     # Effort → provider flag
 │   ├── ndjson-parser.ts      # line-buffered NDJSON
 │   └── __tests__/            # vitest, excluded from build
@@ -43,6 +44,7 @@ Flat layout, single package. No monorepo, no workspaces.
   `AIConversationHandlers`, `ConversationTurn`, `Effort`
 - `runOneShotPrompt` + `OneShotOptions`, `OneShotResult`
 - `listSessions` + `SessionInfo`
+- `listInstances`, `getInstance` + `InstanceInfo`
 
 Nothing else is exported. Internal helpers (NDJSON parser, effort mapping)
 are implementation detail.
@@ -149,6 +151,40 @@ supported gear per provider. `'default'` returns `null` and the flag is
 omitted — the CLI uses its own default. `min` and `max` are silent
 aliases: Codex `min → minimal`, `max → xhigh`; Claude `min → low`. No
 validation of the `model` string — it is passed through as-is.
+
+### Instance registry
+
+A module-level `Map<id, RegistryEntry>` in `registry.ts` holds every live
+instance produced by `createAIConversation`. The factory generates a
+`crypto.randomUUID()` id and hands it to the wrapper constructor.
+
+Registration happens *after* the child process is spawned and its
+`stdout`/`stderr`/`stdin`/`exit`/`error` listeners are wired, but still
+*before* any user callback can fire — i.e. before Claude's synchronous
+`onReady()` at the end of the constructor and before Codex's async
+`initialize()`. Placing it after `spawn(...)` ensures a synchronously
+throwing spawn cannot leak an entry.
+
+Deregistration happens at three points, any of which is safe to run
+twice because `Map.delete` is idempotent:
+
+- Inside `destroy()`, *synchronously* — before the `destroyed = true`
+  guard flips. Immediately after `destroy()` returns, the entry is gone.
+  Codex `initialize()` calls `this.destroy()` in its catch block after
+  `onError`, so a failed handshake does not leave a stale entry.
+- In the `proc.on('exit')` handler, *before* `onExit(code)` fires. A
+  caller inspecting `listInstances()` from inside `onExit` sees the
+  instance already gone.
+- In the `proc.on('error')` handler, via `this.destroy()` after
+  `onError`. Node does not guarantee an `exit` event when `spawn` emits
+  `error` (e.g. ENOENT), so without this path a missing binary would
+  leave a registry entry for a process that never lived.
+
+Meta is a single opaque slot per entry, not per-wrapper state.
+`setMeta(value)` overwrites; `getMeta<T>()` is an unchecked cast. The
+registry observes lifecycle; it does not decide anything. No role
+management, no dispatch, no "send to the idle one" — that stays on the
+caller's side of the boundary.
 
 ### Codex permission handshake
 

@@ -3,6 +3,7 @@ import type { AIConversationInstance, AIConversationHandlers, ConversationTurn, 
 import { NdjsonParser } from './ndjson-parser.js';
 import { effortToCodexValue } from './effort-mapping.js';
 import { loadSessionHistory } from './sessions.js';
+import { register, unregister, setMetaFor, getMetaFor } from './registry.js';
 
 const ENV_BLACKLIST = new Set([
   'NODE_OPTIONS',
@@ -31,6 +32,7 @@ interface PendingRequest {
 export class CodexCLIWrapper implements AIConversationInstance {
   private proc: ChildProcess;
   private readonly cwd: string;
+  private readonly instanceId: string;
   private threadId: string | null = null;
   private history: ConversationTurn[] = [];
   private ready = false;
@@ -52,12 +54,14 @@ export class CodexCLIWrapper implements AIConversationInstance {
   onConversation: (turn: ConversationTurn) => void;
 
   constructor(
-    binary: string, cwd: string, handlers?: AIConversationHandlers,
+    binary: string, cwd: string, instanceId: string,
+    handlers?: AIConversationHandlers,
     systemPrompt?: string, clientInfo?: { name: string; title?: string; version: string },
     sessionId?: string, effort?: Effort, model?: string,
     envExtra?: Record<string, string>,
   ) {
     this.cwd = cwd;
+    this.instanceId = instanceId;
     this.systemPrompt = systemPrompt ?? null;
     this.clientInfo = clientInfo ?? { name: 'daphnis', title: 'Daphnis', version: '1.0.0' };
     this.resumeSessionId = sessionId ?? null;
@@ -115,11 +119,24 @@ export class CodexCLIWrapper implements AIConversationInstance {
     });
 
     this.proc.on('exit', (code) => {
+      unregister(this.instanceId);
       this.onExit(code);
     });
 
     this.proc.on('error', (err) => {
       this.onError(err);
+      this.destroy();
+    });
+
+    // Self-register after spawn wiring is complete and before any user
+    // callback can fire. Placing this after spawn ensures a failing spawn
+    // (synchronous throw) never leaks an entry.
+    register({
+      instance: this,
+      provider: 'codex',
+      cwd,
+      createdAt: new Date(),
+      meta: undefined,
     });
 
     // 4. Start initialization sequence
@@ -144,6 +161,7 @@ export class CodexCLIWrapper implements AIConversationInstance {
       this.onReady();
     } catch (err) {
       this.onError(err instanceof Error ? err : new Error(String(err)));
+      this.destroy();
     }
   }
 
@@ -380,8 +398,21 @@ export class CodexCLIWrapper implements AIConversationInstance {
     return this.proc.pid ?? 0;
   }
 
+  getInstanceId(): string {
+    return this.instanceId;
+  }
+
+  setMeta(value: unknown): void {
+    setMetaFor(this.instanceId, value);
+  }
+
+  getMeta<T = unknown>(): T | undefined {
+    return getMetaFor(this.instanceId) as T | undefined;
+  }
+
   destroy(): void {
     if (this.destroyed) return;
+    unregister(this.instanceId);
     this.destroyed = true;
 
     // Reject all pending requests

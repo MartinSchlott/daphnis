@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 
@@ -9,6 +9,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 const { createAIConversation } = await import('../factory.js');
+const { __resetForTests } = await import('../registry.js');
 
 function createFakeProcess() {
   const proc = new EventEmitter() as EventEmitter & {
@@ -27,6 +28,10 @@ function createFakeProcess() {
 }
 
 describe('createAIConversation', () => {
+  afterEach(() => {
+    __resetForTests();
+  });
+
   it('returns an instance for provider "claude"', () => {
     mockSpawn.mockReturnValue(createFakeProcess());
     const instance = createAIConversation({ provider: 'claude', cwd: '/tmp' });

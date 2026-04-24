@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 
@@ -15,6 +15,10 @@ vi.mock('../sessions.js', () => ({
 }));
 
 const { ClaudeCLIWrapper } = await import('../claude-cli-wrapper.js');
+const { __resetForTests, listInstances, getInstance } = await import('../registry.js');
+const { createAIConversation } = await import('../factory.js');
+
+const TEST_ID = 'test-id';
 
 function createFakeProcess() {
   const proc = new EventEmitter() as EventEmitter & {
@@ -41,6 +45,10 @@ describe('ClaudeCLIWrapper', () => {
     mockSpawn.mockReturnValue(fakeProc);
   });
 
+  afterEach(() => {
+    __resetForTests();
+  });
+
   function feedStdout(data: string) {
     fakeProc.stdout.push(data);
   }
@@ -55,14 +63,14 @@ describe('ClaudeCLIWrapper', () => {
 
   it('fires onReady immediately on construction (before system/init)', () => {
     const onReady = vi.fn();
-    new ClaudeCLIWrapper('claude', '/tmp', { onReady });
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onReady });
 
     // onReady fires in the constructor, not on system/init
     expect(onReady).toHaveBeenCalledOnce();
   });
 
   it('captures session_id from system/init event', () => {
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp');
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
 
     feedStdout(systemInitEvent('sess-abc'));
 
@@ -77,7 +85,7 @@ describe('ClaudeCLIWrapper', () => {
   });
 
   it('getSessionId returns null before system/init and session ID after', () => {
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp');
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
 
     expect(wrapper.getSessionId()).toBeNull();
 
@@ -88,7 +96,7 @@ describe('ClaudeCLIWrapper', () => {
 
   it('sends correct NDJSON on sendMessage (session_id null before init)', () => {
     const chunks: string[] = [];
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp');
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
 
     // No system/init received yet — session_id is null
     fakeProc.stdin.on('data', (chunk: Buffer) => chunks.push(chunk.toString()));
@@ -106,7 +114,7 @@ describe('ClaudeCLIWrapper', () => {
 
   it('sends session_id from init event on subsequent messages', () => {
     const chunks: string[] = [];
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp');
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
 
     fakeProc.stdin.on('data', (chunk: Buffer) => chunks.push(chunk.toString()));
 
@@ -120,7 +128,7 @@ describe('ClaudeCLIWrapper', () => {
   it('fires onConversation for user and assistant turns', async () => {
     const onConversation = vi.fn();
     const onMessage = vi.fn();
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', { onConversation, onMessage });
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onConversation, onMessage });
 
     wrapper.sendMessage('hello');
 
@@ -140,7 +148,7 @@ describe('ClaudeCLIWrapper', () => {
   });
 
   it('getTranscript returns user + assistant turns', async () => {
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp');
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
 
     wrapper.sendMessage('hello');
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -158,7 +166,7 @@ describe('ClaudeCLIWrapper', () => {
   it('fires onError for error result without onConversation', async () => {
     const onError = vi.fn();
     const onConversation = vi.fn();
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', { onError, onConversation });
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError, onConversation });
 
     wrapper.sendMessage('bad input');
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -176,7 +184,7 @@ describe('ClaudeCLIWrapper', () => {
 
   it('fires onError and destroys on stdin write failure', () => {
     const onError = vi.fn();
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', { onError });
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError });
     const destroySpy = vi.spyOn(wrapper, 'destroy');
 
     // Simulate stdin error
@@ -188,7 +196,7 @@ describe('ClaudeCLIWrapper', () => {
 
   it('fires onError when sendMessage called while busy', () => {
     const onError = vi.fn();
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', { onError });
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError });
 
     wrapper.sendMessage('first');
     wrapper.sendMessage('second');
@@ -198,7 +206,7 @@ describe('ClaudeCLIWrapper', () => {
 
   it('fires onError when sendMessage called after destroy', () => {
     const onError = vi.fn();
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', { onError });
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError });
 
     wrapper.destroy();
     wrapper.sendMessage('too late');
@@ -208,7 +216,7 @@ describe('ClaudeCLIWrapper', () => {
 
   it('fires onExit with exit code', () => {
     const onExit = vi.fn();
-    new ClaudeCLIWrapper('claude', '/tmp', { onExit });
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onExit });
 
     fakeProc.emit('exit', 0);
 
@@ -217,7 +225,7 @@ describe('ClaudeCLIWrapper', () => {
 
   it('destroy calls stdin.end and schedules kill', () => {
     vi.useFakeTimers();
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp');
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
     const stdinEnd = vi.spyOn(fakeProc.stdin, 'end');
 
     wrapper.destroy();
@@ -233,7 +241,7 @@ describe('ClaudeCLIWrapper', () => {
 
   it('fires onError and destroys on NDJSON parse error', () => {
     const onError = vi.fn();
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', { onError });
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError });
     const destroySpy = vi.spyOn(wrapper, 'destroy');
 
     feedStdout('this is not json\n');
@@ -244,7 +252,7 @@ describe('ClaudeCLIWrapper', () => {
   });
 
   it('spawns with correct arguments including --print', () => {
-    new ClaudeCLIWrapper('claude', '/my/project');
+    new ClaudeCLIWrapper('claude', '/my/project', TEST_ID);
 
     expect(mockSpawn).toHaveBeenCalledWith(
       'claude',
@@ -259,7 +267,7 @@ describe('ClaudeCLIWrapper', () => {
   // --- sessionId / resume tests ---
 
   it('includes --resume flag when sessionId is provided', () => {
-    new ClaudeCLIWrapper('claude', '/tmp', undefined, undefined, 'prev-session-42');
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, undefined, undefined, 'prev-session-42');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toContain('--resume');
@@ -267,14 +275,14 @@ describe('ClaudeCLIWrapper', () => {
   });
 
   it('does not include --resume flag when sessionId is omitted', () => {
-    new ClaudeCLIWrapper('claude', '/tmp');
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).not.toContain('--resume');
   });
 
   it('sets sessionId immediately when provided (before system/init)', () => {
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', undefined, undefined, 'prev-session-42');
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, undefined, undefined, 'prev-session-42');
 
     expect(wrapper.getSessionId()).toBe('prev-session-42');
   });
@@ -282,7 +290,7 @@ describe('ClaudeCLIWrapper', () => {
   // --- systemPrompt tests ---
 
   it('includes --system-prompt flag when systemPrompt is provided', () => {
-    new ClaudeCLIWrapper('claude', '/tmp', undefined, 'You are a helpful assistant');
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, undefined, 'You are a helpful assistant');
 
     expect(mockSpawn).toHaveBeenCalledWith(
       'claude',
@@ -292,7 +300,7 @@ describe('ClaudeCLIWrapper', () => {
   });
 
   it('does not include --system-prompt flag when systemPrompt is omitted', () => {
-    new ClaudeCLIWrapper('claude', '/tmp');
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).not.toContain('--system-prompt');
@@ -301,7 +309,7 @@ describe('ClaudeCLIWrapper', () => {
   // --- effort / model passthrough ---
 
   it('appends --effort max when effort=max is passed', () => {
-    new ClaudeCLIWrapper('claude', '/tmp', undefined, undefined, undefined, 'max');
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, undefined, undefined, undefined, 'max');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     const idx = spawnArgs.indexOf('--effort');
@@ -310,7 +318,7 @@ describe('ClaudeCLIWrapper', () => {
   });
 
   it('maps effort=min to --effort low', () => {
-    new ClaudeCLIWrapper('claude', '/tmp', undefined, undefined, undefined, 'min');
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, undefined, undefined, undefined, 'min');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     const idx = spawnArgs.indexOf('--effort');
@@ -319,21 +327,21 @@ describe('ClaudeCLIWrapper', () => {
   });
 
   it('omits --effort when effort is undefined', () => {
-    new ClaudeCLIWrapper('claude', '/tmp');
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).not.toContain('--effort');
   });
 
   it('omits --effort when effort=default', () => {
-    new ClaudeCLIWrapper('claude', '/tmp', undefined, undefined, undefined, 'default');
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, undefined, undefined, undefined, 'default');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).not.toContain('--effort');
   });
 
   it('appends --model when model is provided', () => {
-    new ClaudeCLIWrapper('claude', '/tmp', undefined, undefined, undefined, undefined, 'gpt-5.4');
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, 'gpt-5.4');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     const idx = spawnArgs.indexOf('--model');
@@ -342,7 +350,7 @@ describe('ClaudeCLIWrapper', () => {
   });
 
   it('omits --model when model is undefined', () => {
-    new ClaudeCLIWrapper('claude', '/tmp');
+    new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).not.toContain('--model');
@@ -353,7 +361,7 @@ describe('ClaudeCLIWrapper', () => {
   it('fires onError when process exits with non-zero code while busy', async () => {
     const onError = vi.fn();
     const onExit = vi.fn();
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', { onError, onExit });
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError, onExit });
 
     wrapper.sendMessage('hello');
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -368,7 +376,7 @@ describe('ClaudeCLIWrapper', () => {
 
   it('resets busy flag when process exits unexpectedly', async () => {
     const onError = vi.fn();
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', { onError });
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError });
 
     wrapper.sendMessage('hello');
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -387,7 +395,7 @@ describe('ClaudeCLIWrapper', () => {
 
   it('surfaces stderr content in onError when process exits with non-zero code', async () => {
     const onError = vi.fn();
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', { onError });
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError });
 
     wrapper.sendMessage('hello');
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -410,7 +418,7 @@ describe('ClaudeCLIWrapper', () => {
     ];
     mockLoadSessionHistory.mockResolvedValue(priorTurns);
 
-    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', undefined, undefined, 'resume-sess-1');
+    const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, undefined, undefined, 'resume-sess-1');
 
     // Call getTranscript() twice in parallel
     const [result1, result2] = await Promise.all([
@@ -432,5 +440,72 @@ describe('ClaudeCLIWrapper', () => {
     const result3 = await wrapper.getTranscript();
     expect(result3).toEqual(result1);
     expect(mockLoadSessionHistory).toHaveBeenCalledOnce();
+  });
+
+  describe('registry integration', () => {
+    it('registers instance with factory-assigned id', () => {
+      const instance = createAIConversation({ provider: 'claude', cwd: '/tmp' });
+      const id = instance.getInstanceId();
+
+      expect(id).toBeTruthy();
+      expect(getInstance(id)).toBe(instance);
+
+      const list = listInstances();
+      expect(list).toHaveLength(1);
+      expect(list[0].id).toBe(id);
+      expect(list[0].provider).toBe('claude');
+      expect(list[0].cwd).toBe('/tmp');
+      expect(list[0].meta).toBeUndefined();
+    });
+
+    it('setMeta is reflected in listInstances and getMeta', () => {
+      const instance = createAIConversation({ provider: 'claude', cwd: '/tmp' });
+      instance.setMeta({ label: 'L' });
+
+      expect(instance.getMeta<{ label: string }>()).toEqual({ label: 'L' });
+      expect(listInstances()[0].meta).toEqual({ label: 'L' });
+    });
+
+    it('destroy() removes the entry synchronously', () => {
+      const instance = createAIConversation({ provider: 'claude', cwd: '/tmp' });
+      expect(listInstances()).toHaveLength(1);
+
+      instance.destroy();
+      expect(listInstances()).toHaveLength(0);
+    });
+
+    it('deregisters when the process emits error (e.g. ENOENT)', () => {
+      const onError = vi.fn();
+      createAIConversation({
+        provider: 'claude',
+        cwd: '/tmp',
+        handlers: { onError },
+      });
+
+      expect(listInstances()).toHaveLength(1);
+      fakeProc.emit('error', new Error('ENOENT'));
+
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'ENOENT' }));
+      expect(listInstances()).toHaveLength(0);
+    });
+
+    it('deregisters before onExit runs', () => {
+      let lengthAtExit = -1;
+      createAIConversation({
+        provider: 'claude',
+        cwd: '/tmp',
+        handlers: {
+          onExit: () => {
+            lengthAtExit = listInstances().length;
+          },
+        },
+      });
+
+      expect(listInstances()).toHaveLength(1);
+      fakeProc.emit('exit', 0);
+
+      expect(lengthAtExit).toBe(0);
+      expect(listInstances()).toHaveLength(0);
+    });
   });
 });

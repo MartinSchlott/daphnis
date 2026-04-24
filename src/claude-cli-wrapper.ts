@@ -3,6 +3,7 @@ import type { AIConversationInstance, AIConversationHandlers, ConversationTurn, 
 import { NdjsonParser } from './ndjson-parser.js';
 import { effortToClaudeFlag } from './effort-mapping.js';
 import { loadSessionHistory } from './sessions.js';
+import { register, unregister, setMetaFor, getMetaFor } from './registry.js';
 
 const ENV_BLACKLIST = new Set([
   'NODE_OPTIONS',
@@ -26,6 +27,7 @@ function filterEnv(): Record<string, string> {
 export class ClaudeCLIWrapper implements AIConversationInstance {
   private proc: ChildProcess;
   private readonly cwd: string;
+  private readonly instanceId: string;
   private sessionId: string | null = null;
   private readonly resumeSessionId: string | null;
   private history: ConversationTurn[] = [];
@@ -43,11 +45,13 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
   onConversation: (turn: ConversationTurn) => void;
 
   constructor(
-    binary: string, cwd: string, handlers?: AIConversationHandlers,
+    binary: string, cwd: string, instanceId: string,
+    handlers?: AIConversationHandlers,
     systemPrompt?: string, sessionId?: string, effort?: Effort, model?: string,
     envExtra?: Record<string, string>,
   ) {
     this.cwd = cwd;
+    this.instanceId = instanceId;
     this.resumeSessionId = sessionId ?? null;
 
     // 1. Set no-op defaults
@@ -125,11 +129,24 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
         this.onError(new Error(message));
         this.destroy();
       }
+      unregister(this.instanceId);
       this.onExit(code);
     });
 
     this.proc.on('error', (err) => {
       this.onError(err);
+      this.destroy();
+    });
+
+    // Self-register after spawn wiring is complete and before any user
+    // callback can fire (onReady at end of ctor). Placing this after spawn
+    // ensures a failing spawn (synchronous throw) never leaks an entry.
+    register({
+      instance: this,
+      provider: 'claude',
+      cwd,
+      createdAt: new Date(),
+      meta: undefined,
     });
 
     // Ready immediately — the CLI is alive and accepts stdin. The system/init
@@ -245,8 +262,21 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
     return this.proc.pid ?? 0;
   }
 
+  getInstanceId(): string {
+    return this.instanceId;
+  }
+
+  setMeta(value: unknown): void {
+    setMetaFor(this.instanceId, value);
+  }
+
+  getMeta<T = unknown>(): T | undefined {
+    return getMetaFor(this.instanceId) as T | undefined;
+  }
+
   destroy(): void {
     if (this.destroyed) return;
+    unregister(this.instanceId);
     this.destroyed = true;
 
     try {

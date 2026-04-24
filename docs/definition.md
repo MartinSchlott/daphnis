@@ -38,6 +38,10 @@ cannot be modelled without compromise is out of scope.
   schema, timeout, and `AbortSignal` cancellation.
 - `listSessions(provider, cwd)` — enumerate persisted sessions for the
   given working directory.
+- `listInstances()` / `getInstance(id)` — passive registry of live
+  instances. Per-instance `getInstanceId()`, `setMeta(value)`, and
+  `getMeta<T>()` let callers hang an opaque payload on an instance and
+  look it up without keeping their own map.
 - Uniform effort levels (`default | min | low | medium | high | xhigh |
   max`) mapped to the closest provider-supported gear.
 - Uniform `ConversationTurn` shape (`role`, `content`, `timestamp`).
@@ -53,8 +57,9 @@ cannot be modelled without compromise is out of scope.
 - **Git integration.** Credential helpers, `GH_TOKEN` injection, account
   resolution — not here. Caller passes whatever env it wants.
 - **Multi-agent orchestration.** Role management (coder/reviewer/architect),
-  state machines, auto-dispatch — not here. Daphnis gives you one instance;
-  orchestrating several is the caller's job.
+  state machines, auto-dispatch — not here. Daphnis gives you one instance
+  and a passive registry to enumerate several; *orchestrating* them (who
+  does what, when) is the caller's job.
 - **Portable / remote sessions.** Claude and Codex persist sessions under
   `~/.claude/projects/…` and `~/.codex/sessions/…`, keyed by
   `(host user, cwd)`. Daphnis honours that. Sessions are not portable
@@ -76,6 +81,10 @@ cannot be modelled without compromise is out of scope.
   v1.
 - **Effort** — abstract reasoning level, mapped per provider. `'default'`
   passes no flag and lets the CLI decide.
+- **Instance** — a live `AIConversationInstance` produced by
+  `createAIConversation`. Identified by a Daphnis-assigned UUID
+  (`getInstanceId()`), independent of the provider's `sessionId`. Carries
+  one opaque caller-supplied `meta` slot.
 
 ## Success criteria
 

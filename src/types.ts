@@ -32,6 +32,12 @@ export interface AIConversationInstance {
 
   // Process identity
   getPid: () => number;
+
+  // Registry identity & metadata
+  getInstanceId: () => string;
+  setMeta: (value: unknown) => void;
+  /** Unchecked cast — the registry stores meta as `unknown`. */
+  getMeta: <T = unknown>() => T | undefined;
 }
 
 /**

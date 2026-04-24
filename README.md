@@ -33,6 +33,8 @@ Same code works with `provider: 'codex'`. No branches in your caller.
 
 **Environment hygiene.** Before spawn, daphnis strips `NODE_OPTIONS`, `VSCODE_INSPECTOR_OPTIONS`, `VSCODE_PID`, `VSCODE_IPC_HOOK`, `ELECTRON_RUN_AS_NODE`, `CLAUDECODE` from the inherited env. Without this, a caller running inside Claude Code or VS Code leaks its host state into the child CLI and breaks auth or execution. Your own `env` option wins on collisions.
 
+**Instance registry.** Every instance produced by `createAIConversation` is auto-registered under a daphnis-assigned UUID. `listInstances()` returns a fresh DTO array; `getInstance(id)` returns the live reference. Each instance exposes `getInstanceId()` and a single opaque meta slot (`setMeta(value)` / `getMeta<T>()`) so callers can hang a project name, label, or whatever on an instance without keeping a parallel map. Deregistration is automatic: synchronous on `destroy()`, and before `onExit` fires on a child exit. The registry is passive — enumeration and metadata only, no orchestration.
+
 ## Quick taste
 
 ```typescript
@@ -142,7 +144,7 @@ Daphnis: thin TypeScript wrapper around the official Claude CLI and OpenAI Codex
 
 **Session storage:** Claude writes `~/.claude/projects/<cwd-slash-to-dash>/<session-uuid>.jsonl` — the cwd is encoded by replacing `/` and whitespace with `-`. Codex writes `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl` with the cwd embedded in a `session_meta` payload. `listSessions` reads those paths directly. Consequence: sessions are bound to `(host user, cwd)` and are not portable between machines or users. Moving `.claude/projects` between hosts will not preserve session continuity — that's a consequence of using the CLIs as intended, not a daphnis limitation.
 
-**Public API surface — `src/index.ts` re-exports exactly:** `createAIConversation`, `AIConversationInstance`, `AIConversationOptions`, `AIConversationHandlers`, `ConversationTurn`, `Effort`, `runOneShotPrompt`, `OneShotOptions`, `OneShotResult`, `listSessions`, `SessionInfo`. Nothing else. Internal helpers (`NdjsonParser`, effort mapping, `loadSessionHistory`) are implementation detail and not exposed.
+**Public API surface — `src/index.ts` re-exports exactly:** `createAIConversation`, `AIConversationInstance`, `AIConversationOptions`, `AIConversationHandlers`, `ConversationTurn`, `Effort`, `runOneShotPrompt`, `OneShotOptions`, `OneShotResult`, `listSessions`, `SessionInfo`, `listInstances`, `getInstance`, `InstanceInfo`. Nothing else. Internal helpers (`NdjsonParser`, effort mapping, `loadSessionHistory`, internal registry `register` / `unregister` / `setMetaFor` / `getMetaFor`) are implementation detail and not exposed.
 
 **Runtime dependencies:** zero. `@types/node`, `typescript`, `vitest` are devDependencies only. Node ≥ 18, ESM, `moduleResolution: "Node16"`.
 
@@ -157,3 +159,4 @@ Cwd cannot change mid-session. The CLI pins it at spawn. To switch, `destroy()` 
 No retry, no rate-limit handling, no backoff. If the CLI exits non-zero or errors mid-stream, you get the error and whatever was written. Retry is the caller's concern.
 Codex permission scope is the session cwd, exactly. `fileSystem.read`/`write` arrays contain only the cwd string. If the CLI tries to touch files outside cwd, the request will be denied. Pass a broader cwd at spawn, or fork the permission handler.
 Persistent sessions survive process death only through the on-disk `.jsonl` file. If you kill the daphnis process and start a new one, pass the `sessionId` to the new `createAIConversation` to pick up where you left off. There is no in-memory handover — the CLI re-reads its own transcript from disk on `--resume` / `thread/resume`.
+Registry deregistration runs *before* `onExit` fires, and `listInstances()` DTOs carry whatever `getSessionId()` returns *at call time* — which is `null` on Claude until the first reply arrives. A caller iterating `listInstances()` for Claude entries right after construction must tolerate `sessionId: null`, same as reading `getSessionId()` directly.

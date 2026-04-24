@@ -10,3 +10,5 @@ export { runOneShotPrompt } from './one-shot.js';
 export type { OneShotOptions, OneShotResult } from './one-shot.js';
 export { listSessions } from './sessions.js';
 export type { SessionInfo } from './sessions.js';
+export { listInstances, getInstance } from './registry.js';
+export type { InstanceInfo } from './registry.js';

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 
@@ -9,6 +9,10 @@ vi.mock('node:child_process', () => ({
 }));
 
 const { CodexCLIWrapper } = await import('../codex-cli-wrapper.js');
+const { __resetForTests, listInstances, getInstance } = await import('../registry.js');
+const { createAIConversation } = await import('../factory.js');
+
+const TEST_ID = 'test-id';
 
 function createFakeProcess() {
   const proc = new EventEmitter() as EventEmitter & {
@@ -49,6 +53,10 @@ describe('CodexCLIWrapper', () => {
     mockSpawn.mockReturnValue(fakeProc);
   });
 
+  afterEach(() => {
+    __resetForTests();
+  });
+
   function feedStdout(data: string) {
     fakeProc.stdout.push(data);
   }
@@ -80,7 +88,7 @@ describe('CodexCLIWrapper', () => {
 
   it('fires onReady after successful initialization', async () => {
     const onReady = vi.fn();
-    new CodexCLIWrapper('codex', '/tmp', { onReady });
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onReady });
 
     await completeInit();
 
@@ -88,7 +96,7 @@ describe('CodexCLIWrapper', () => {
   });
 
   it('getSessionId returns null before init and thread ID after', async () => {
-    const wrapper = new CodexCLIWrapper('codex', '/tmp');
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
     expect(wrapper.getSessionId()).toBeNull();
 
@@ -99,7 +107,7 @@ describe('CodexCLIWrapper', () => {
 
   it('sends initialize with experimentalApi and configurable clientInfo', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    new CodexCLIWrapper('codex', '/tmp');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
     // Wait for initialize to be written
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -125,7 +133,7 @@ describe('CodexCLIWrapper', () => {
 
   it('sends thread/resume instead of thread/start when sessionId is provided', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    new CodexCLIWrapper('codex', '/tmp', undefined, undefined, undefined, 'prev-thread-99');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, 'prev-thread-99');
 
     await new Promise(resolve => setTimeout(resolve, 10));
 
@@ -148,7 +156,7 @@ describe('CodexCLIWrapper', () => {
 
   it('sends thread/start when sessionId is not provided', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    new CodexCLIWrapper('codex', '/tmp');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
     await new Promise(resolve => setTimeout(resolve, 10));
 
@@ -164,7 +172,7 @@ describe('CodexCLIWrapper', () => {
 
   it('uses custom clientInfo when provided', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    new CodexCLIWrapper('codex', '/tmp', undefined, undefined, { name: 'myapp', title: 'My App', version: '2.0.0' });
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, { name: 'myapp', title: 'My App', version: '2.0.0' });
 
     await new Promise(resolve => setTimeout(resolve, 10));
 
@@ -175,7 +183,7 @@ describe('CodexCLIWrapper', () => {
 
   it('fires onError on init failure', async () => {
     const onError = vi.fn();
-    new CodexCLIWrapper('codex', '/tmp', { onError });
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError });
 
     await new Promise(resolve => setTimeout(resolve, 10));
 
@@ -190,7 +198,7 @@ describe('CodexCLIWrapper', () => {
   it('sends turn/start on sendMessage and fires onConversation for user turn', async () => {
     const onConversation = vi.fn();
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onConversation });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onConversation });
 
     await completeInit();
 
@@ -215,7 +223,7 @@ describe('CodexCLIWrapper', () => {
 
   it('includes collaborationMode in turn/start when systemPrompt is set', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', undefined, 'You are a code reviewer');
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, 'You are a code reviewer');
 
     await completeInit();
 
@@ -236,7 +244,7 @@ describe('CodexCLIWrapper', () => {
 
   it('does not include collaborationMode when systemPrompt is not set', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp');
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
     await completeInit();
 
@@ -255,7 +263,7 @@ describe('CodexCLIWrapper', () => {
     const onConversation = vi.fn();
     const onMessage = vi.fn();
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onConversation, onMessage });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onConversation, onMessage });
 
     await completeInit();
 
@@ -286,7 +294,7 @@ describe('CodexCLIWrapper', () => {
     const onError = vi.fn();
     const onConversation = vi.fn();
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onError, onConversation });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError, onConversation });
 
     await completeInit();
 
@@ -308,7 +316,7 @@ describe('CodexCLIWrapper', () => {
 
   it('auto-approves command execution requests', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp');
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
     await completeInit();
 
@@ -330,7 +338,7 @@ describe('CodexCLIWrapper', () => {
 
   it('auto-approves file change requests', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp');
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
     await completeInit();
 
@@ -351,7 +359,7 @@ describe('CodexCLIWrapper', () => {
 
   it('auto-approves permissions requests with schema-valid payload', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp');
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
     await completeInit();
 
@@ -395,7 +403,7 @@ describe('CodexCLIWrapper', () => {
 
   it('responds with failure for unsupported tool calls', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp');
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
     await completeInit();
 
@@ -419,7 +427,7 @@ describe('CodexCLIWrapper', () => {
   it('reads turn status from params.turn.status (not params.status)', async () => {
     const onConversation = vi.fn();
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onConversation });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onConversation });
 
     await completeInit();
 
@@ -447,7 +455,7 @@ describe('CodexCLIWrapper', () => {
   it('handles multiple server requests in one turn', async () => {
     const onConversation = vi.fn();
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onConversation });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onConversation });
 
     await completeInit();
 
@@ -483,7 +491,7 @@ describe('CodexCLIWrapper', () => {
     const onError = vi.fn();
     const stdinChunks = captureStdin(fakeProc);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onError });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError });
 
     await completeInit();
 
@@ -509,7 +517,7 @@ describe('CodexCLIWrapper', () => {
 
   it('fires onError when sendMessage called before ready', async () => {
     const onError = vi.fn();
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onError });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError });
 
     // Don't complete init
     await wrapper.sendMessage('too early');
@@ -520,7 +528,7 @@ describe('CodexCLIWrapper', () => {
   it('fires onError when sendMessage called while busy', async () => {
     const onError = vi.fn();
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onError });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError });
 
     await completeInit();
 
@@ -539,7 +547,7 @@ describe('CodexCLIWrapper', () => {
 
   it('getTranscript returns correct turns', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    const wrapper = new CodexCLIWrapper('codex', '/tmp');
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
     await completeInit();
 
@@ -564,7 +572,7 @@ describe('CodexCLIWrapper', () => {
 
   it('destroy rejects pending requests and cleans up', async () => {
     const onError = vi.fn();
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onError });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError });
 
     // Give the constructor time to send initialize request
     await new Promise(resolve => setTimeout(resolve, 20));
@@ -581,7 +589,7 @@ describe('CodexCLIWrapper', () => {
 
   it('fires onError and destroys on NDJSON parse error', async () => {
     const onError = vi.fn();
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onError });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError });
     const destroySpy = vi.spyOn(wrapper, 'destroy');
 
     // Feed invalid JSON — this will trigger parse error before init completes
@@ -599,7 +607,7 @@ describe('CodexCLIWrapper', () => {
 
   it('handles stdin error by rejecting pending requests and firing onError', async () => {
     const onError = vi.fn();
-    const wrapper = new CodexCLIWrapper('codex', '/tmp', { onError });
+    const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError });
     const destroySpy = vi.spyOn(wrapper, 'destroy');
 
     // Give time for init request to be sent
@@ -620,7 +628,7 @@ describe('CodexCLIWrapper', () => {
   });
 
   it('spawns with correct arguments', () => {
-    new CodexCLIWrapper('codex', '/my/project');
+    new CodexCLIWrapper('codex', '/my/project', TEST_ID);
 
     expect(mockSpawn).toHaveBeenCalledWith(
       'codex',
@@ -635,44 +643,137 @@ describe('CodexCLIWrapper', () => {
   // --- effort / model passthrough ---
 
   it('prepends -c model_reasoning_effort=xhigh when effort=max is passed (max → xhigh)', () => {
-    new CodexCLIWrapper('codex', '/tmp', undefined, undefined, undefined, undefined, 'max');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, 'max');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toEqual(['-c', 'model_reasoning_effort=xhigh', 'app-server']);
   });
 
   it('prepends -c model_reasoning_effort=minimal when effort=min is passed', () => {
-    new CodexCLIWrapper('codex', '/tmp', undefined, undefined, undefined, undefined, 'min');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, 'min');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toEqual(['-c', 'model_reasoning_effort=minimal', 'app-server']);
   });
 
   it('does not include -c model_reasoning_effort when effort is undefined', () => {
-    new CodexCLIWrapper('codex', '/tmp');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs.find((a) => a.startsWith('model_reasoning_effort='))).toBeUndefined();
   });
 
   it('does not include -c model_reasoning_effort when effort=default', () => {
-    new CodexCLIWrapper('codex', '/tmp', undefined, undefined, undefined, undefined, 'default');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, 'default');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs.find((a) => a.startsWith('model_reasoning_effort='))).toBeUndefined();
   });
 
   it('passes -m model before app-server', () => {
-    new CodexCLIWrapper('codex', '/tmp', undefined, undefined, undefined, undefined, undefined, 'gpt-5.4');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, undefined, 'gpt-5.4');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toEqual(['-m', 'gpt-5.4', 'app-server']);
   });
 
   it('places all global flags before app-server when both effort and model are set', () => {
-    new CodexCLIWrapper('codex', '/tmp', undefined, undefined, undefined, undefined, 'high', 'gpt-x');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, 'high', 'gpt-x');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toEqual(['-c', 'model_reasoning_effort=high', '-m', 'gpt-x', 'app-server']);
+  });
+
+  describe('registry integration', () => {
+    it('registers instance with factory-assigned id', async () => {
+      const instance = createAIConversation({ provider: 'codex', cwd: '/tmp' });
+      const id = instance.getInstanceId();
+
+      expect(id).toBeTruthy();
+      expect(getInstance(id)).toBe(instance);
+
+      const list = listInstances();
+      expect(list).toHaveLength(1);
+      expect(list[0].id).toBe(id);
+      expect(list[0].provider).toBe('codex');
+      expect(list[0].cwd).toBe('/tmp');
+      expect(list[0].meta).toBeUndefined();
+
+      instance.destroy();
+    });
+
+    it('setMeta is reflected in listInstances and getMeta', () => {
+      const instance = createAIConversation({ provider: 'codex', cwd: '/tmp' });
+      instance.setMeta({ label: 'L' });
+
+      expect(instance.getMeta<{ label: string }>()).toEqual({ label: 'L' });
+      expect(listInstances()[0].meta).toEqual({ label: 'L' });
+
+      instance.destroy();
+    });
+
+    it('destroy() removes the entry synchronously', () => {
+      const instance = createAIConversation({ provider: 'codex', cwd: '/tmp' });
+      expect(listInstances()).toHaveLength(1);
+
+      instance.destroy();
+      expect(listInstances()).toHaveLength(0);
+    });
+
+    it('deregisters when the process emits error (e.g. ENOENT)', () => {
+      const onError = vi.fn();
+      createAIConversation({
+        provider: 'codex',
+        cwd: '/tmp',
+        handlers: { onError },
+      });
+
+      expect(listInstances()).toHaveLength(1);
+      fakeProc.emit('error', new Error('ENOENT'));
+
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'ENOENT' }));
+      expect(listInstances()).toHaveLength(0);
+    });
+
+    it('deregisters before onExit runs', () => {
+      let lengthAtExit = -1;
+      createAIConversation({
+        provider: 'codex',
+        cwd: '/tmp',
+        handlers: {
+          onExit: () => {
+            lengthAtExit = listInstances().length;
+          },
+        },
+      });
+
+      expect(listInstances()).toHaveLength(1);
+      fakeProc.emit('exit', 0);
+
+      expect(lengthAtExit).toBe(0);
+      expect(listInstances()).toHaveLength(0);
+    });
+
+    it('removes entry when init handshake fails and process exits', async () => {
+      const onError = vi.fn();
+      createAIConversation({ provider: 'codex', cwd: '/tmp', handlers: { onError } });
+
+      expect(listInstances()).toHaveLength(1);
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      // initialize fails — wrapper should call onError and destroy()
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -1, message: 'init failed' } }) + '\n');
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      expect(onError).toHaveBeenCalled();
+
+      // destroy() synchronously removed the entry
+      expect(listInstances()).toHaveLength(0);
+
+      // And the exit path (once the child actually dies) is a no-op for the registry
+      fakeProc.emit('exit', 1);
+      expect(listInstances()).toHaveLength(0);
+    });
   });
 });
