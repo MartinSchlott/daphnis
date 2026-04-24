@@ -78,6 +78,23 @@ const resumed  = createAIConversation({
   handlers:  { onMessage: console.log },
 })
 const transcript = await resumed.getTranscript() // includes prior turns
+
+// Multi-session bookkeeping via the registry — no hand-rolled Map
+import { listInstances, getInstance } from '@ai-inquisitor/daphnis'
+
+for (const project of ['api', 'web', 'infra']) {
+  const agent = createAIConversation({ provider: 'claude', cwd: `/repos/${project}` })
+  agent.setMeta({ project, label: `reviewer:${project}` })
+}
+
+for (const info of listInstances()) {
+  const { project, label } = info.meta as { project: string; label: string }
+  console.log(`${info.id} cwd=${info.cwd} session=${info.sessionId ?? '(pending)'} project=${project} label=${label}`)
+}
+
+// Look a specific one back up and drive it
+const target = listInstances().find(i => (i.meta as { project: string }).project === 'api')!
+getInstance(target.id)!.sendMessage('Open PR against main.')
 ```
 
 ## As a library
@@ -128,7 +145,7 @@ const agent = createAIConversation({
 
 ## LLM Reference
 
-Daphnis: thin TypeScript wrapper around the official Claude CLI and OpenAI Codex CLI. Two execution modes (persistent conversation, one-shot), three public functions (`createAIConversation`, `runOneShotPrompt`, `listSessions`), one uniform provider switch (`'claude' | 'codex'`). Uses the CLIs exactly as their vendors intended — this is what makes it TOS-conform: it's a wrapper, not a proxy or re-implementation.
+Daphnis: thin TypeScript wrapper around the official Claude CLI and OpenAI Codex CLI. Two execution modes (persistent conversation, one-shot), five public functions (`createAIConversation`, `runOneShotPrompt`, `listSessions`, `listInstances`, `getInstance`), one uniform provider switch (`'claude' | 'codex'`). Uses the CLIs exactly as their vendors intended — this is what makes it TOS-conform: it's a wrapper, not a proxy or re-implementation.
 
 **Architecture — why two modes:** Persistent and one-shot have different process models. Persistent = long-lived child with open stdio where messages flow both ways; Codex adds a JSON-RPC handshake and Claude adds NDJSON stream-json framing. One-shot = spawn with `stdin: 'ignore'`, collect stdout, parse, exit. The modes share the env filter, effort mapping, and NDJSON parser — nothing else. They do not try to present a common "session" that isn't really there.
 
@@ -141,6 +158,8 @@ Daphnis: thin TypeScript wrapper around the official Claude CLI and OpenAI Codex
 **Effort mapping:** `'default' | 'min' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'`. `'default'` returns `null` → flag omitted, CLI decides. `'min'` / `'max'` are silent aliases to the nearest supported gear: Claude `min → low`; Codex `min → minimal`, `max → xhigh`. `model` is passed through unchanged — no validation of the string against any known list. No way to pass raw provider-native levels; if the mapping is wrong for you, fork.
 
 **ENV_BLACKLIST at spawn:** `NODE_OPTIONS`, `VSCODE_INSPECTOR_OPTIONS`, `VSCODE_PID`, `VSCODE_IPC_HOOK`, `ELECTRON_RUN_AS_NODE`, `CLAUDECODE`. Stripped from `process.env` before merging caller-supplied `options.env`. Caller env wins on key collisions. Why: a daphnis caller running inside Claude Code or a VS Code JS debugger leaks its host state into the child CLI; the child then either picks up the wrong auth (Claude sees `CLAUDECODE` and thinks it's embedded) or crashes on inherited inspector flags.
+
+**Instance registry:** Module-level `Map<id, RegistryEntry>` in `registry.ts`. `createAIConversation` generates a `crypto.randomUUID()` and hands it to the wrapper constructor; the wrapper self-registers *after* `spawn(...)` succeeds and all `proc.on(...)` listeners are wired, but *before* the first user callback can fire (Claude's synchronous `onReady`, Codex's async `initialize()`). Placing it after spawn means a synchronously throwing spawn cannot leak an entry. Deregistration fires from three paths, all idempotent because `Map.delete` is: `destroy()` (synchronous — the entry is gone the instant `destroy()` returns; Codex `initialize()` calls `this.destroy()` in its catch block, so a failed handshake cleans up too), `proc.on('exit')` (before `onExit(code)` runs — callers inspecting `listInstances()` from inside `onExit` see the instance already gone), and `proc.on('error')` via `this.destroy()` (ENOENT guard — Node does not guarantee an `exit` event when `spawn` emits `error`, so without this path a missing binary would leave a dead entry). `listInstances()` returns a fresh `InstanceInfo[]` each call, built from the live wrapper's `getSessionId` / `getPid` / `getInstanceId` plus the stored `provider` / `cwd` / `createdAt` / `meta`. `getInstance(id)` returns the live reference. Meta is a single opaque slot (`setMeta(value: unknown)` overwrites, `getMeta<T>()` is an unchecked cast). No key-value API, no schema — callers who want multiple fields pass an object. The registry is passive: enumeration and metadata only, no role management, no dispatch, no "send to the idle one". That stays on the caller's side of the orchestration boundary.
 
 **Session storage:** Claude writes `~/.claude/projects/<cwd-slash-to-dash>/<session-uuid>.jsonl` — the cwd is encoded by replacing `/` and whitespace with `-`. Codex writes `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl` with the cwd embedded in a `session_meta` payload. `listSessions` reads those paths directly. Consequence: sessions are bound to `(host user, cwd)` and are not portable between machines or users. Moving `.claude/projects` between hosts will not preserve session continuity — that's a consequence of using the CLIs as intended, not a daphnis limitation.
 
