@@ -33,7 +33,8 @@ cannot be modelled without compromise is out of scope.
 ### In scope
 
 - `createAIConversation(options)` — persistent session with streaming
-  callbacks, resume by session id, transcript retrieval.
+  callbacks, resume by session id, transcript retrieval, and turn-level
+  cancellation (`interrupt()`).
 - `runOneShotPrompt(options)` — single-shot prompt with optional JSON
   schema, timeout, and `AbortSignal` cancellation.
 - `listSessions(provider, cwd)` — enumerate persisted sessions for the

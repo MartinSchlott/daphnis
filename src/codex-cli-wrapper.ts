@@ -44,6 +44,10 @@ export class CodexCLIWrapper implements AIConversationInstance {
   private readonly systemPrompt: string | null;
   private readonly resumeSessionId: string | null;
   private historyLoadPromise: Promise<void> | null = null;
+  private currentTurnId: string | null = null;
+  private interrupting = false;
+  private busyClearedResolve: (() => void) | null = null;
+  private busyClearedReject: ((e: Error) => void) | null = null;
 
   // Mutable callbacks
   onReady: () => void;
@@ -113,22 +117,26 @@ export class CodexCLIWrapper implements AIConversationInstance {
     });
 
     this.proc.stdin!.on('error', (err) => {
-      // Reject all pending requests on stdin failure
-      for (const [id, pending] of this.pendingRequests) {
-        pending.reject(err);
-        this.pendingRequests.delete(id);
-      }
-      this.busy = false;
+      this.tearDownChild(err);
       this.onError(err);
       this.destroy();
     });
 
     this.proc.on('exit', (code) => {
+      const exitMessage = `Process exited with code ${code}`;
+      const exitError = new Error(exitMessage);
+      const wasBusy = this.busy;
+      this.tearDownChild(exitError);
+
+      if (wasBusy) {
+        this.onError(exitError);
+      }
       unregister(this.instanceId);
       this.onExit(code);
     });
 
     this.proc.on('error', (err) => {
+      this.tearDownChild(err);
       this.onError(err);
       this.destroy();
     });
@@ -314,12 +322,46 @@ export class CodexCLIWrapper implements AIConversationInstance {
         const turn = p?.['turn'] as Record<string, unknown> | undefined;
         const status = turn?.['status'] as string | undefined;
 
-        // Reset busy BEFORE callbacks — callbacks may synchronously call
+        // Reset state BEFORE callbacks — callbacks may synchronously call
         // sendMessage (e.g. marker retry), which would fail with "Already
         // processing" if busy is still true.
         const completedContent = this.turnBuffer;
         this.turnBuffer = '';
         this.busy = false;
+        this.currentTurnId = null;
+
+        if (this.interrupting) {
+          this.interrupting = false;
+          const resolveBusy = this.busyClearedResolve;
+          const rejectBusy = this.busyClearedReject;
+          this.busyClearedResolve = null;
+          this.busyClearedReject = null;
+
+          if (status === 'interrupted') {
+            resolveBusy?.();
+            return;
+          }
+          if (status === 'completed') {
+            // Natural completion race: turn finished before the cancel
+            // landed. Push the assistant turn so getTranscript()
+            // (in-memory only) does not silently lose a successfully
+            // produced answer.
+            resolveBusy?.();
+            const assistantTurn: ConversationTurn = {
+              role: 'assistant',
+              content: completedContent,
+              timestamp: new Date(),
+            };
+            this.history.push(assistantTurn);
+            this.onConversation(assistantTurn);
+            this.onMessage(assistantTurn.content);
+            return;
+          }
+          const err = new Error(`Turn failed with status: ${status ?? 'unknown'}`);
+          rejectBusy?.(err);
+          this.onError(err);
+          return;
+        }
 
         if (status === 'completed') {
           const assistantTurn: ConversationTurn = {
@@ -369,7 +411,11 @@ export class CodexCLIWrapper implements AIConversationInstance {
           settings: { developer_instructions: this.systemPrompt },
         };
       }
-      await this.sendJsonRpcRequest('turn/start', turnParams);
+      const result = await this.sendJsonRpcRequest('turn/start', turnParams) as
+        { turn?: { id?: string } } | undefined;
+      if (typeof result?.turn?.id === 'string') {
+        this.currentTurnId = result.turn.id;
+      }
 
       const userTurn: ConversationTurn = {
         role: 'user',
@@ -415,18 +461,63 @@ export class CodexCLIWrapper implements AIConversationInstance {
     return getMetaFor(this.instanceId) as T | undefined;
   }
 
+  async interrupt(): Promise<void> {
+    if (this.destroyed) throw new Error('Destroyed');
+    if (!this.busy) throw new Error('Not busy');
+    if (!this.threadId || !this.currentTurnId) {
+      throw new Error('No active turn to interrupt');
+    }
+    if (this.interrupting) throw new Error('Interrupt already in progress');
+    this.interrupting = true;
+
+    const ack = this.sendJsonRpcRequest('turn/interrupt', {
+      threadId: this.threadId,
+      turnId: this.currentTurnId,
+    });
+
+    const busyCleared = new Promise<void>((resolve, reject) => {
+      this.busyClearedResolve = resolve;
+      this.busyClearedReject = reject;
+    });
+
+    try {
+      await Promise.all([ack, busyCleared]);
+    } catch (err) {
+      this.interrupting = false;
+      throw err;
+    } finally {
+      this.busyClearedResolve = null;
+      this.busyClearedReject = null;
+    }
+  }
+
+  /**
+   * Reset all live state on external child death (stdin error, exit, or
+   * spawn error). Idempotent. Rejects pending JSON-RPC requests and any
+   * pending interrupt, clears turn-level state.
+   */
+  private tearDownChild(err: Error): void {
+    for (const [id, pending] of this.pendingRequests) {
+      pending.reject(err);
+      this.pendingRequests.delete(id);
+    }
+    if (this.busyClearedReject) {
+      this.busyClearedReject(err);
+    }
+    this.busyClearedResolve = null;
+    this.busyClearedReject = null;
+    this.interrupting = false;
+    this.busy = false;
+    this.currentTurnId = null;
+    this.turnBuffer = '';
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     unregister(this.instanceId);
     this.destroyed = true;
 
-    // Reject all pending requests
-    for (const [id, pending] of this.pendingRequests) {
-      pending.reject(new Error('Destroyed'));
-      this.pendingRequests.delete(id);
-    }
-
-    this.turnBuffer = '';
+    this.tearDownChild(new Error('Destroyed'));
 
     try {
       this.proc.stdin!.end();

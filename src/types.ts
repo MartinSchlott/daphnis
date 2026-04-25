@@ -23,6 +23,29 @@ export interface AIConversationInstance {
   sendMessage: (text: string) => void;
   onMessage: (text: string) => void;
 
+  /**
+   * Cancel the in-flight turn while keeping the session alive. Resolves once
+   * the provider has acknowledged the cancellation *and* the terminator
+   * event has cleared the busy flag — i.e. the instance is actually ready
+   * for the next `sendMessage`. There is no internal timeout: race the
+   * returned promise against your own `AbortSignal`/timer and call
+   * `destroy()` if you want to give up.
+   *
+   * Rejects when not busy, when destroyed, when an interrupt is already in
+   * progress, when the provider's ack carries an error, when the child
+   * exits/errors before the cancel completes, or when the in-flight turn
+   * fails for a reason unrelated to the cancel — `onError` still fires in
+   * that last case and `interrupt()` rejects with the same error.
+   *
+   * History semantics: the in-memory user turn of the cancelled exchange is
+   * retained. If the cancel actually interrupted the turn, no assistant
+   * turn is appended. If the turn finished naturally during the cancel
+   * race, the assistant turn IS appended and the normal `onMessage` /
+   * `onConversation` callbacks fire — `getTranscript()` is in-memory only,
+   * so silently dropping a successfully produced answer would erase it.
+   */
+  interrupt: () => Promise<void>;
+
   // History
   onConversation: (turn: ConversationTurn) => void;
   getTranscript: () => Promise<ConversationTurn[]>;

@@ -563,6 +563,256 @@ describe('ClaudeCLIWrapper', () => {
     });
   });
 
+  describe('interrupt()', () => {
+    function controlResponseEvent(requestId: string, subtype: 'success' | 'error' = 'success', error?: string) {
+      return JSON.stringify({
+        type: 'control_response',
+        response: {
+          subtype,
+          request_id: requestId,
+          ...(error !== undefined ? { error } : {}),
+        },
+      }) + '\n';
+    }
+
+    function interruptResultEvent() {
+      return JSON.stringify({
+        type: 'result',
+        subtype: 'error_during_execution',
+        result: 'interrupted',
+        is_error: true,
+      }) + '\n';
+    }
+
+    function captureControlRequest(): Promise<{ requestId: string }> {
+      return new Promise((resolve) => {
+        fakeProc.stdin.on('data', (chunk: Buffer) => {
+          for (const line of chunk.toString().split('\n')) {
+            if (!line.trim()) continue;
+            try {
+              const parsed = JSON.parse(line) as Record<string, unknown>;
+              if (parsed['type'] === 'control_request') {
+                resolve({ requestId: parsed['request_id'] as string });
+                return;
+              }
+            } catch {
+              // Not JSON, skip
+            }
+          }
+        });
+      });
+    }
+
+    it('rejects when not busy', async () => {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
+      await expect(wrapper.interrupt()).rejects.toThrow('Not busy');
+    });
+
+    it('rejects when destroyed', async () => {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
+      wrapper.destroy();
+      await expect(wrapper.interrupt()).rejects.toThrow('Destroyed');
+    });
+
+    it('writes the correct control_request NDJSON line', async () => {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
+      wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+
+      const captured = captureControlRequest();
+      void wrapper.interrupt().catch(() => {});
+      const { requestId } = await captured;
+      expect(typeof requestId).toBe('string');
+      expect(requestId.length).toBeGreaterThan(0);
+    });
+
+    it('resolves only after BOTH control_response success AND interrupt-terminator result arrive', async () => {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
+      wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+
+      const captured = captureControlRequest();
+      const interruptPromise = wrapper.interrupt();
+      const { requestId } = await captured;
+
+      let settled = false;
+      interruptPromise.then(() => { settled = true; }, () => { settled = true; });
+
+      // Only control_response → still pending
+      feedStdout(controlResponseEvent(requestId, 'success'));
+      await new Promise(r => setTimeout(r, 10));
+      expect(settled).toBe(false);
+
+      // Now feed terminator
+      feedStdout(interruptResultEvent());
+      await interruptPromise;
+      expect(settled).toBe(true);
+    });
+
+    it('suppresses onError and assistant turn for the interrupt-terminator result', async () => {
+      const onError = vi.fn();
+      const onConversation = vi.fn();
+      const onMessage = vi.fn();
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError, onConversation, onMessage });
+      wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+      onConversation.mockClear();
+
+      const captured = captureControlRequest();
+      const interruptPromise = wrapper.interrupt();
+      const { requestId } = await captured;
+
+      feedStdout(controlResponseEvent(requestId, 'success'));
+      feedStdout(interruptResultEvent());
+      await interruptPromise;
+
+      expect(onError).not.toHaveBeenCalled();
+      expect(onConversation).not.toHaveBeenCalled();
+      expect(onMessage).not.toHaveBeenCalled();
+    });
+
+    it('natural-completion race: assistant turn IS appended and callbacks fire', async () => {
+      const onConversation = vi.fn();
+      const onMessage = vi.fn();
+      const onError = vi.fn();
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onConversation, onMessage, onError });
+      wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+      onConversation.mockClear();
+
+      const captured = captureControlRequest();
+      const interruptPromise = wrapper.interrupt();
+      const { requestId } = await captured;
+
+      feedStdout(controlResponseEvent(requestId, 'success'));
+      feedStdout(resultEvent('finished naturally', false));
+      await interruptPromise;
+
+      expect(onError).not.toHaveBeenCalled();
+      expect(onConversation).toHaveBeenCalledTimes(1);
+      expect(onConversation.mock.calls[0][0].role).toBe('assistant');
+      expect(onConversation.mock.calls[0][0].content).toBe('finished naturally');
+      expect(onMessage).toHaveBeenCalledWith('finished naturally');
+
+      const transcript = await wrapper.getTranscript();
+      expect(transcript[transcript.length - 1].content).toBe('finished naturally');
+    });
+
+    it('failure race: rejects AND onError fires for non-interrupt is_error result', async () => {
+      const onError = vi.fn();
+      const onConversation = vi.fn();
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError, onConversation });
+      wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+      onConversation.mockClear();
+
+      const captured = captureControlRequest();
+      const interruptPromise = wrapper.interrupt();
+      const { requestId } = await captured;
+
+      feedStdout(controlResponseEvent(requestId, 'success'));
+      // Non-interrupt failure: subtype is something other than 'error_during_execution'
+      feedStdout(JSON.stringify({
+        type: 'result', subtype: 'error_max_turns',
+        result: 'max turns', is_error: true,
+      }) + '\n');
+
+      await expect(interruptPromise).rejects.toThrow('max turns');
+      expect(onError).toHaveBeenCalledOnce();
+      expect(onError.mock.calls[0][0].message).toBe('max turns');
+      expect(onConversation).not.toHaveBeenCalled();
+
+      // sendMessage still works
+      wrapper.sendMessage('retry');
+      await new Promise(r => setTimeout(r, 10));
+    });
+
+    it('subsequent sendMessage works after interrupt() resolves', async () => {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
+      wrapper.sendMessage('first');
+      await new Promise(r => setTimeout(r, 10));
+
+      const captured = captureControlRequest();
+      const interruptPromise = wrapper.interrupt();
+      const { requestId } = await captured;
+      feedStdout(controlResponseEvent(requestId, 'success'));
+      feedStdout(interruptResultEvent());
+      await interruptPromise;
+
+      // Should not throw "Already processing"
+      const onError = vi.fn();
+      wrapper.onError = onError;
+      wrapper.sendMessage('second');
+      await new Promise(r => setTimeout(r, 10));
+      expect(onError).not.toHaveBeenCalled();
+    });
+
+    it('rejects on control_response error subtype', async () => {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
+      wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+
+      const captured = captureControlRequest();
+      const interruptPromise = wrapper.interrupt();
+      const { requestId } = await captured;
+
+      feedStdout(controlResponseEvent(requestId, 'error', 'control failed'));
+      await expect(interruptPromise).rejects.toThrow('control failed');
+    });
+
+    it('rejects when child exits before completion', async () => {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError: () => {}, onExit: () => {} });
+      wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+
+      const interruptPromise = wrapper.interrupt();
+      // catch the captureControlRequest data event so the chunk listener does not block;
+      // we don't need the request id here.
+      await new Promise(r => setTimeout(r, 5));
+
+      fakeProc.emit('exit', 1);
+      await expect(interruptPromise).rejects.toThrow(/exit/i);
+    });
+
+    it('rejects when child errors before completion', async () => {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID, { onError: () => {} });
+      wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+
+      const interruptPromise = wrapper.interrupt();
+      await new Promise(r => setTimeout(r, 5));
+
+      fakeProc.emit('error', new Error('ENOENT'));
+      await expect(interruptPromise).rejects.toThrow('ENOENT');
+    });
+
+    it('rejects with Destroyed when destroy() is called while interrupt is pending', async () => {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
+      wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+
+      const interruptPromise = wrapper.interrupt();
+      await new Promise(r => setTimeout(r, 5));
+      wrapper.destroy();
+
+      await expect(interruptPromise).rejects.toThrow('Destroyed');
+    });
+
+    it('concurrent interrupt() rejects second call', async () => {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
+      wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+
+      const first = wrapper.interrupt();
+      first.catch(() => {});
+      await expect(wrapper.interrupt()).rejects.toThrow('Interrupt already in progress');
+
+      // Tear down
+      wrapper.destroy();
+      await first.catch(() => {});
+    });
+  });
+
   describe('lifecycle events', () => {
     it('construction emits instance:added exactly once', () => {
       const added = vi.fn();

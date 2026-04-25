@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import type { AIConversationInstance, AIConversationHandlers, ConversationTurn, Effort } from './types.js';
 import { NdjsonParser } from './ndjson-parser.js';
 import { effortToClaudeFlag } from './effort-mapping.js';
@@ -36,6 +37,10 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
   private destroyed = false;
   private stderrBuffer = '';
   private historyLoadPromise: Promise<void> | null = null;
+  private pendingControlRequests = new Map<string, { resolve: () => void; reject: (e: Error) => void }>();
+  private interrupting = false;
+  private busyClearedResolve: (() => void) | null = null;
+  private busyClearedReject: ((e: Error) => void) | null = null;
 
   // Mutable callbacks
   onReady: () => void;
@@ -121,18 +126,25 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
     });
 
     this.proc.stdin!.on('error', (err) => {
+      this.rejectPendingControl(err);
+      this.failPendingInterrupt(err);
       this.onError(err);
       this.destroy();
     });
 
     this.proc.on('exit', (code) => {
+      const detail = this.stderrBuffer.trim();
+      const exitMessage = detail
+        ? `Process exited with code ${code}: ${detail}`
+        : `Process exited with code ${code}`;
+      const exitError = new Error(exitMessage);
+
+      this.rejectPendingControl(exitError);
+      this.failPendingInterrupt(exitError);
+
       if (this.busy) {
-        const detail = this.stderrBuffer.trim();
-        const message = detail
-          ? `Process exited with code ${code}: ${detail}`
-          : `Process exited with code ${code}`;
         this.busy = false;
-        this.onError(new Error(message));
+        this.onError(exitError);
         this.destroy();
       }
       unregister(this.instanceId);
@@ -140,6 +152,8 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
     });
 
     this.proc.on('error', (err) => {
+      this.rejectPendingControl(err);
+      this.failPendingInterrupt(err);
       this.onError(err);
       this.destroy();
     });
@@ -165,6 +179,22 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
     if (typeof obj !== 'object' || obj === null) return;
     const msg = obj as Record<string, unknown>;
 
+    if (msg['type'] === 'control_response') {
+      const response = msg['response'] as Record<string, unknown> | undefined;
+      const requestId = response?.['request_id'] as string | undefined;
+      if (!requestId) return;
+      const pending = this.pendingControlRequests.get(requestId);
+      if (!pending) return;
+      this.pendingControlRequests.delete(requestId);
+      if (response?.['subtype'] === 'success') {
+        pending.resolve();
+      } else {
+        const errMsg = (response?.['error'] as string) ?? 'control_request failed';
+        pending.reject(new Error(errMsg));
+      }
+      return;
+    }
+
     switch (msg['type']) {
       case 'system': {
         const subtype = (msg['subtype'] as string) ?? '';
@@ -177,12 +207,46 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
       }
       case 'result': {
         const isError = msg['is_error'] === true;
+        const subtype = msg['subtype'] as string | undefined;
         const resultText = typeof msg['result'] === 'string' ? msg['result'] : '';
+        const isInterruptTerminator = isError && subtype === 'error_during_execution';
 
         // Reset busy BEFORE callbacks — callbacks may synchronously call
         // sendMessage (e.g. marker retry), which would fail with "Already
         // processing" if busy is still true.
         this.busy = false;
+
+        if (this.interrupting) {
+          this.interrupting = false;
+          const resolveBusy = this.busyClearedResolve;
+          const rejectBusy = this.busyClearedReject;
+          this.busyClearedResolve = null;
+          this.busyClearedReject = null;
+
+          if (isInterruptTerminator) {
+            resolveBusy?.();
+            return;
+          }
+          if (isError) {
+            const err = new Error(resultText);
+            rejectBusy?.(err);
+            this.onError(err);
+            return;
+          }
+          // Natural completion race: turn finished before the cancel landed.
+          // Push the assistant turn so getTranscript() (in-memory only) does
+          // not silently lose a successfully produced answer.
+          resolveBusy?.();
+          const turn: ConversationTurn = {
+            role: 'assistant',
+            content: resultText,
+            timestamp: new Date(),
+          };
+          this.history.push(turn);
+          this.onConversation(turn);
+          this.onMessage(turn.content);
+          return;
+        }
 
         if (isError) {
           this.onError(new Error(resultText));
@@ -205,6 +269,22 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
         // Forward compatibility — ignore unknown types
         break;
     }
+  }
+
+  private rejectPendingControl(err: Error): void {
+    for (const [, pending] of this.pendingControlRequests) {
+      pending.reject(err);
+    }
+    this.pendingControlRequests.clear();
+  }
+
+  private failPendingInterrupt(err: Error): void {
+    if (this.busyClearedReject) {
+      this.busyClearedReject(err);
+    }
+    this.busyClearedResolve = null;
+    this.busyClearedReject = null;
+    this.interrupting = false;
   }
 
   sendMessage(text: string): void {
@@ -280,10 +360,48 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
     return getMetaFor(this.instanceId) as T | undefined;
   }
 
+  async interrupt(): Promise<void> {
+    if (this.destroyed) throw new Error('Destroyed');
+    if (!this.busy) throw new Error('Not busy');
+    if (this.interrupting) throw new Error('Interrupt already in progress');
+    this.interrupting = true;
+
+    const requestId = randomUUID();
+    const message = JSON.stringify({
+      type: 'control_request',
+      request_id: requestId,
+      request: { subtype: 'interrupt' },
+    });
+
+    const ack = new Promise<void>((resolve, reject) => {
+      this.pendingControlRequests.set(requestId, { resolve, reject });
+    });
+
+    const busyCleared = new Promise<void>((resolve, reject) => {
+      this.busyClearedResolve = resolve;
+      this.busyClearedReject = reject;
+    });
+
+    try {
+      this.proc.stdin!.write(message + '\n');
+      await Promise.all([ack, busyCleared]);
+    } catch (err) {
+      this.interrupting = false;
+      throw err;
+    } finally {
+      this.busyClearedResolve = null;
+      this.busyClearedReject = null;
+    }
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     unregister(this.instanceId);
     this.destroyed = true;
+
+    const destroyedErr = new Error('Destroyed');
+    this.rejectPendingControl(destroyedErr);
+    this.failPendingInterrupt(destroyedErr);
 
     try {
       this.proc.stdin!.end();

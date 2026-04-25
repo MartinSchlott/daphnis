@@ -39,6 +39,7 @@ describe('createAIConversation', () => {
     expect(typeof instance.sendMessage).toBe('function');
     expect(typeof instance.getTranscript).toBe('function');
     expect(typeof instance.destroy).toBe('function');
+    expect(typeof instance.interrupt).toBe('function');
   });
 
   it('spawns claude binary for provider "claude" with explicit binary', () => {
@@ -58,6 +59,7 @@ describe('createAIConversation', () => {
     const instance = createAIConversation({ provider: 'codex', cwd: '/tmp' });
     expect(instance).toBeDefined();
     expect(typeof instance.sendMessage).toBe('function');
+    expect(typeof instance.interrupt).toBe('function');
   });
 
   it('spawns codex binary for provider "codex" with explicit binary', () => {

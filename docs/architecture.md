@@ -63,9 +63,11 @@ spawn claude --print --input-format stream-json
              [--resume <id>] [--system-prompt ...]
              [--effort ...] [--model ...] [...extraArgs]
   ↓ stdin: JSON line per user message
+                   {"type":"control_request",...subtype:"interrupt"} for cancel
   ↑ stdout: NDJSON stream
-      type=system/init  → capture session_id
-      type=result       → emit assistant turn, reset busy BEFORE callback
+      type=system/init       → capture session_id
+      type=result            → emit assistant turn, reset busy BEFORE callback
+      type=control_response  → resolve/reject the matching interrupt() ack
 ```
 
 Ready fires immediately on spawn — the `system/init` event only arrives
@@ -82,7 +84,9 @@ spawn codex [global flags] app-server
 
   ↓↑ JSON-RPC 2.0 over stdio
       initialize → thread/start or thread/resume → ready
-      turn/start → item/agentMessage/delta (buffer) → turn/completed
+      turn/start (capture turn.id) → item/agentMessage/delta (buffer)
+        → turn/completed (status: completed | interrupted | failed)
+      turn/interrupt(threadId, turnId) — sent by interrupt() to cancel
       Server-initiated requests (approval, tool/call) auto-responded
 ```
 
@@ -259,6 +263,74 @@ because the wrapper registers before any async failure path can fire.
 Late subscribers do not receive replayed history; consumers compose
 `listInstances()` with `instanceEvents.on('instance:added', …)` for full
 coverage.
+
+### Interrupt protocol
+
+`AIConversationInstance.interrupt()` cancels the in-flight turn while
+keeping the session alive. Both providers expose a native cancel that
+preserves the session; Daphnis surfaces it uniformly.
+
+**Wire-level shapes:**
+
+- **Claude** uses an in-band control protocol on the same stdio pipe.
+  The wrapper writes
+  `{"type":"control_request","request_id":<uuid>,"request":{"subtype":"interrupt"}}`
+  and watches stdout for
+  `{"type":"control_response","response":{"subtype":"success","request_id":<uuid>}}`.
+  The in-flight turn then ends as a `result` with `is_error: true` and
+  `subtype: "error_during_execution"`. The `session_id` stays valid.
+- **Codex** uses a JSON-RPC method, `turn/interrupt({ threadId, turnId })`.
+  Synchronous response is `{}`. The in-flight turn terminates with a
+  regular `turn/completed` notification, but `turn.status === "interrupted"`.
+  The thread stays alive. To send `turnId`, the wrapper captures
+  `result.turn.id` from the `turn/start` response and clears it on every
+  terminal turn event.
+
+**Resolution contract:** `interrupt()` waits for `Promise.all([ack,
+busyCleared])`. The control-channel ack and the terminator can arrive in
+either order; both halves must settle before the promise resolves. This
+guarantees that, by the time `await interrupt()` returns, the wrapper's
+`busy` flag is already clear and the next `sendMessage` will not throw
+`Already processing`.
+
+**No internal timeout.** A hung CLI cannot be healed from inside the
+wrapper — and a forced `destroy()` plus "resume via `getSessionId()`"
+would chain further failure modes (unwritten session id, half-written
+JSONL, resume spawn failure). The single source of truth for the "give
+up" decision is the caller: race the returned promise against an
+`AbortSignal`/timer and call `destroy()` after if you want a hard stop.
+Pending control requests and pending interrupt promises are still
+rejected at the *real* failure boundary — every `proc.on('exit')`,
+`proc.on('error')`, and `stdin.on('error')` handler rejects them with
+the underlying cause, so a dead child does not leak a forever-pending
+promise.
+
+**Race semantics for the in-memory transcript.** Three terminator cases
+can race the cancel:
+
+1. *Real interrupt* (Claude `is_error=true` + `subtype="error_during_execution"`,
+   Codex `status="interrupted"`): no assistant turn appended, no
+   `onError`, `interrupt()` resolves. The dangling user turn from the
+   cancelled exchange stays.
+2. *Natural completion* (Claude `is_error=false`, Codex `status="completed"`):
+   the turn finished before the cancel landed. The assistant turn IS
+   appended and the normal `onConversation` / `onMessage` callbacks
+   fire, because `getTranscript()` is in-memory only and silently
+   dropping a successfully produced answer would erase it permanently.
+   `interrupt()` still resolves.
+3. *Real provider failure* during the cancel race (any other error
+   subtype / `status="failed"`): `onError` fires AND `interrupt()`
+   rejects with the same error. Masking a real failure as a successful
+   cancel would hide a real bug.
+
+**Persisted-history caveat.** Whether Claude's
+`error_during_execution` result lands in
+`~/.claude/projects/.../<session>.jsonl` is undocumented; same for
+Codex's interrupted-turn rollout files. `getTranscript()` is in-memory
+only for the lifetime of an instance — it does not re-read the on-disk
+JSONL after the initial resume-time load. Daphnis does not edit the
+on-disk JSONL and does not invent a uniform marker; the in-memory
+transcript is authoritative for the live instance.
 
 ### Codex permission handshake
 

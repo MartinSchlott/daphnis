@@ -811,6 +811,297 @@ describe('CodexCLIWrapper', () => {
     });
   });
 
+  describe('interrupt()', () => {
+    /** Drive a sendMessage to the busy state with a captured currentTurnId. */
+    async function startBusyTurn(
+      wrapper: InstanceType<typeof CodexCLIWrapper>,
+      stdinChunks: string[],
+      turnId = 'turn-xyz',
+    ): Promise<void> {
+      const sendPromise = wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+      const turnMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'turn/start');
+      feedStdout(JSON.stringify({
+        jsonrpc: '2.0',
+        id: turnMsg!['id'],
+        result: { turn: { id: turnId } },
+      }) + '\n');
+      await sendPromise;
+    }
+
+    it('rejects when not busy', async () => {
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
+      await completeInit();
+      await expect(wrapper.interrupt()).rejects.toThrow('Not busy');
+    });
+
+    it('rejects when destroyed', async () => {
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
+      await completeInit();
+      wrapper.destroy();
+      await expect(wrapper.interrupt()).rejects.toThrow('Destroyed');
+    });
+
+    it('captures turn.id from turn/start response', async () => {
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
+      await completeInit();
+      await startBusyTurn(wrapper, stdinChunks, 'turn-captured-1');
+
+      void wrapper.interrupt().catch(() => {});
+      await new Promise(r => setTimeout(r, 5));
+      const interruptMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'turn/interrupt');
+      expect(interruptMsg).toBeDefined();
+      expect((interruptMsg!['params'] as Record<string, unknown>)['turnId']).toBe('turn-captured-1');
+    });
+
+    it('rejects with "No active turn to interrupt" when turn/start response lacks turn.id', async () => {
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
+      await completeInit();
+
+      const sendPromise = wrapper.sendMessage('hello');
+      await new Promise(r => setTimeout(r, 10));
+      const turnMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'turn/start');
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', id: turnMsg!['id'], result: {} }) + '\n');
+      await sendPromise;
+
+      await expect(wrapper.interrupt()).rejects.toThrow('No active turn to interrupt');
+    });
+
+    it('sends turn/interrupt with correct threadId+turnId', async () => {
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
+      await completeInit('thread-A');
+      await startBusyTurn(wrapper, stdinChunks, 'turn-B');
+
+      void wrapper.interrupt().catch(() => {});
+      await new Promise(r => setTimeout(r, 5));
+
+      const interruptMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'turn/interrupt');
+      expect(interruptMsg).toBeDefined();
+      const params = interruptMsg!['params'] as Record<string, unknown>;
+      expect(params['threadId']).toBe('thread-A');
+      expect(params['turnId']).toBe('turn-B');
+    });
+
+    it('resolves only after BOTH the JSON-RPC ack AND turn/completed status="interrupted" arrive', async () => {
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
+      await completeInit();
+      await startBusyTurn(wrapper, stdinChunks);
+
+      const interruptPromise = wrapper.interrupt();
+      await new Promise(r => setTimeout(r, 5));
+
+      let settled = false;
+      interruptPromise.then(() => { settled = true; }, () => { settled = true; });
+
+      const interruptMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'turn/interrupt');
+      // Ack only — still pending
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', id: interruptMsg!['id'], result: {} }) + '\n');
+      await new Promise(r => setTimeout(r, 10));
+      expect(settled).toBe(false);
+
+      // Notification arrives
+      feedStdout(JSON.stringify({
+        jsonrpc: '2.0', method: 'turn/completed',
+        params: { threadId: 'thread-abc', turn: { status: 'interrupted' } },
+      }) + '\n');
+      await interruptPromise;
+      expect(settled).toBe(true);
+    });
+
+    it('suppresses onError, clears state, no assistant turn for status="interrupted"', async () => {
+      const onError = vi.fn();
+      const onConversation = vi.fn();
+      const onMessage = vi.fn();
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError, onConversation, onMessage });
+      await completeInit();
+      await startBusyTurn(wrapper, stdinChunks);
+      onConversation.mockClear();
+
+      // Push some delta so turnBuffer is non-empty
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { delta: 'partial' } }) + '\n');
+
+      const interruptPromise = wrapper.interrupt();
+      await new Promise(r => setTimeout(r, 5));
+      const interruptMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'turn/interrupt');
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', id: interruptMsg!['id'], result: {} }) + '\n');
+      feedStdout(JSON.stringify({
+        jsonrpc: '2.0', method: 'turn/completed',
+        params: { threadId: 'thread-abc', turn: { status: 'interrupted' } },
+      }) + '\n');
+      await interruptPromise;
+
+      expect(onError).not.toHaveBeenCalled();
+      expect(onConversation).not.toHaveBeenCalled();
+      expect(onMessage).not.toHaveBeenCalled();
+    });
+
+    it('natural-completion race: assistant turn IS pushed with buffered content', async () => {
+      const onConversation = vi.fn();
+      const onMessage = vi.fn();
+      const onError = vi.fn();
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onConversation, onMessage, onError });
+      await completeInit();
+      await startBusyTurn(wrapper, stdinChunks);
+      onConversation.mockClear();
+
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { delta: 'all done' } }) + '\n');
+
+      const interruptPromise = wrapper.interrupt();
+      await new Promise(r => setTimeout(r, 5));
+      const interruptMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'turn/interrupt');
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', id: interruptMsg!['id'], result: {} }) + '\n');
+      feedStdout(JSON.stringify({
+        jsonrpc: '2.0', method: 'turn/completed',
+        params: { threadId: 'thread-abc', turn: { status: 'completed' } },
+      }) + '\n');
+      await interruptPromise;
+
+      expect(onError).not.toHaveBeenCalled();
+      expect(onConversation).toHaveBeenCalledTimes(1);
+      expect(onConversation.mock.calls[0][0].role).toBe('assistant');
+      expect(onConversation.mock.calls[0][0].content).toBe('all done');
+      expect(onMessage).toHaveBeenCalledWith('all done');
+    });
+
+    it('failure race: rejects AND onError fires for status="failed"', async () => {
+      const onError = vi.fn();
+      const onConversation = vi.fn();
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError, onConversation });
+      await completeInit();
+      await startBusyTurn(wrapper, stdinChunks);
+      onConversation.mockClear();
+
+      const interruptPromise = wrapper.interrupt();
+      await new Promise(r => setTimeout(r, 5));
+      const interruptMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'turn/interrupt');
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', id: interruptMsg!['id'], result: {} }) + '\n');
+      feedStdout(JSON.stringify({
+        jsonrpc: '2.0', method: 'turn/completed',
+        params: { threadId: 'thread-abc', turn: { status: 'failed' } },
+      }) + '\n');
+
+      await expect(interruptPromise).rejects.toThrow('Turn failed with status: failed');
+      expect(onError).toHaveBeenCalledOnce();
+      expect(onError.mock.calls[0][0].message).toBe('Turn failed with status: failed');
+      expect(onConversation).not.toHaveBeenCalled();
+    });
+
+    it('subsequent sendMessage works after interrupt() resolves', async () => {
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
+      await completeInit();
+      await startBusyTurn(wrapper, stdinChunks, 'turn-1');
+
+      const interruptPromise = wrapper.interrupt();
+      await new Promise(r => setTimeout(r, 5));
+      const interruptMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'turn/interrupt');
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', id: interruptMsg!['id'], result: {} }) + '\n');
+      feedStdout(JSON.stringify({
+        jsonrpc: '2.0', method: 'turn/completed',
+        params: { threadId: 'thread-abc', turn: { status: 'interrupted' } },
+      }) + '\n');
+      await interruptPromise;
+
+      // Now a new sendMessage should produce a fresh turn/start
+      const sendPromise = wrapper.sendMessage('again');
+      await new Promise(r => setTimeout(r, 10));
+      const allTurnStarts = parseCapturedMessages(stdinChunks).filter(m => m['method'] === 'turn/start');
+      expect(allTurnStarts.length).toBeGreaterThanOrEqual(2);
+      const lastStart = allTurnStarts[allTurnStarts.length - 1];
+      feedStdout(JSON.stringify({
+        jsonrpc: '2.0',
+        id: lastStart['id'],
+        result: { turn: { id: 'turn-2' } },
+      }) + '\n');
+      await sendPromise;
+    });
+
+    it('external child death — exit handler resets all live state', async () => {
+      const onError = vi.fn();
+      const onExit = vi.fn();
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError, onExit });
+      await completeInit();
+      await startBusyTurn(wrapper, stdinChunks, 'turn-doomed');
+
+      // push some buffer
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { delta: 'partial' } }) + '\n');
+      await new Promise(r => setTimeout(r, 5));
+
+      fakeProc.emit('exit', 1);
+      await new Promise(r => setTimeout(r, 5));
+
+      expect(onExit).toHaveBeenCalledWith(1);
+      expect(onError).toHaveBeenCalled();
+      expect(onError.mock.calls[onError.mock.calls.length - 1][0].message).toMatch(/exit.*1/i);
+
+      // After tearDown, sendMessage should fail with 'Destroyed' (because exit
+      // path does not call destroy() unless busy AND we did call destroy here
+      // implicitly… actually exit handler does NOT call destroy in our impl,
+      // so the wrapper is not destroyed but state is reset. A follow-up
+      // sendMessage should NOT throw 'Already processing'. We accept either
+      // 'Not ready' (since ready stays true) → no, ready stays true. So the
+      // wrapper accepts a new sendMessage but the child is dead → stdin
+      // write may fail. That's the caller's concern; we just verify state
+      // reset.
+      const onError2 = vi.fn();
+      wrapper.onError = onError2;
+      wrapper.sendMessage('after death');
+      await new Promise(r => setTimeout(r, 5));
+      const messages = onError2.mock.calls.map(c => (c[0] as Error).message);
+      expect(messages).not.toContain('Already processing');
+    });
+
+    it('rejects when child exits before the notification arrives', async () => {
+      const onError = vi.fn();
+      const onExit = vi.fn();
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError, onExit });
+      await completeInit();
+      await startBusyTurn(wrapper, stdinChunks);
+
+      const interruptPromise = wrapper.interrupt();
+      await new Promise(r => setTimeout(r, 5));
+
+      fakeProc.emit('exit', 1);
+      await expect(interruptPromise).rejects.toThrow(/exit/i);
+    });
+
+    it('rejects with Destroyed when destroy() is called while interrupt is pending', async () => {
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
+      await completeInit();
+      await startBusyTurn(wrapper, stdinChunks);
+
+      const interruptPromise = wrapper.interrupt();
+      await new Promise(r => setTimeout(r, 5));
+      wrapper.destroy();
+
+      await expect(interruptPromise).rejects.toThrow('Destroyed');
+    });
+
+    it('concurrent interrupt() rejects second call', async () => {
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID, { onError: () => {}, onExit: () => {} });
+      await completeInit();
+      await startBusyTurn(wrapper, stdinChunks);
+
+      const first = wrapper.interrupt();
+      first.catch(() => {});
+      await expect(wrapper.interrupt()).rejects.toThrow('Interrupt already in progress');
+
+      wrapper.destroy();
+      await first.catch(() => {});
+    });
+  });
+
   describe('lifecycle events', () => {
     it('construction emits instance:added exactly once', () => {
       const added = vi.fn();
