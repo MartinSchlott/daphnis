@@ -9,13 +9,13 @@ export function createAIConversation(options: AIConversationOptions): AIConversa
   switch (options.provider) {
     case 'claude':
       return new ClaudeCLIWrapper(
-        binary, options.cwd, id, options.handlers, options.systemPrompt,
+        binary, options.cwd, id, options.systemPrompt,
         options.sessionId, options.effort, options.model, options.env,
         options.fullAccess, options.extraArgs,
       );
     case 'codex':
       return new CodexCLIWrapper(
-        binary, options.cwd, id, options.handlers, options.systemPrompt,
+        binary, options.cwd, id, options.systemPrompt,
         options.sessionId, options.effort, options.model, options.env,
         options.fullAccess, options.extraArgs,
       );

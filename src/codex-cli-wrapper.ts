@@ -1,9 +1,14 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import type { AIConversationInstance, AIConversationHandlers, ConversationTurn, Effort } from './types.js';
+import { EventEmitter } from 'node:events';
+import type { AIConversationInstance, ConversationTurn, Effort, InstanceMessageEventMap } from './types.js';
 import { NdjsonParser } from './ndjson-parser.js';
 import { effortToCodexValue } from './effort-mapping.js';
 import { loadSessionHistory } from './sessions.js';
-import { register, unregister, setMetaFor, getMetaFor, emitReady } from './registry.js';
+import {
+  register, unregister, setMetaFor, getMetaFor,
+  setExitCodeFor, transitionState, getState,
+  type InstanceState,
+} from './registry.js';
 
 const ENV_BLACKLIST = new Set([
   'NODE_OPTIONS',
@@ -29,15 +34,16 @@ interface PendingRequest {
   reject: (error: Error) => void;
 }
 
-export class CodexCLIWrapper implements AIConversationInstance {
+export class CodexCLIWrapper
+  extends EventEmitter<InstanceMessageEventMap>
+  implements AIConversationInstance
+{
   private proc: ChildProcess;
   private readonly cwd: string;
   private readonly instanceId: string;
   private threadId: string | null = null;
   private history: ConversationTurn[] = [];
-  private ready = false;
-  private busy = false;
-  private destroyed = false;
+  private terminationScheduled = false;
   private nextRequestId = 1;
   private pendingRequests = new Map<number, PendingRequest>();
   private turnBuffer = '';
@@ -49,44 +55,46 @@ export class CodexCLIWrapper implements AIConversationInstance {
   private busyClearedResolve: (() => void) | null = null;
   private busyClearedReject: ((e: Error) => void) | null = null;
 
-  // Mutable callbacks
-  onReady: () => void;
-  onExit: (exitCode: number | null) => void;
-  onError: (error: Error) => void;
-  onMessage: (text: string) => void;
-  onConversation: (turn: ConversationTurn) => void;
+  readonly ready: Promise<void>;
+  private resolveReady!: () => void;
+  private rejectReady!: (err: Error) => void;
+
+  get state(): InstanceState {
+    return getState(this.instanceId);
+  }
 
   constructor(
     binary: string, cwd: string, instanceId: string,
-    handlers?: AIConversationHandlers,
     systemPrompt?: string,
     sessionId?: string, effort?: Effort, model?: string,
     envExtra?: Record<string, string>,
     fullAccess?: boolean, extraArgs?: string[],
   ) {
+    super();
     this.cwd = cwd;
     this.instanceId = instanceId;
     this.systemPrompt = systemPrompt ?? null;
     this.resumeSessionId = sessionId ?? null;
 
-    // 1. Set no-op defaults
-    this.onReady = handlers?.onReady ?? (() => {});
-    this.onExit = handlers?.onExit ?? (() => {});
-    this.onError = handlers?.onError ?? (() => {});
-    this.onMessage = handlers?.onMessage ?? (() => {});
-    this.onConversation = handlers?.onConversation ?? (() => {});
+    this.ready = new Promise<void>((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
+    this.ready.catch(() => {});
 
-    // 2. Create NDJSON parser
     const parser = new NdjsonParser({
       onParsed: (obj) => this.handleParsed(obj),
       onError: (_line, error) => {
-        this.onError(new Error(`NDJSON parse error: ${error.message}`));
+        const wrapped = new Error(`NDJSON parse error: ${error.message}`);
+        if (getState(this.instanceId) === 'spawning') {
+          this.rejectReady(wrapped);
+        } else {
+          this.safeEmitError(wrapped);
+        }
         this.destroy();
       },
     });
 
-    // 3. Spawn process. Global flags (effort, model) precede the `app-server`
-    // subcommand — codex does not accept them after.
     const globalFlags: string[] = [];
     if (fullAccess === true) {
       globalFlags.push('--dangerously-bypass-approvals-and-sandbox');
@@ -117,33 +125,49 @@ export class CodexCLIWrapper implements AIConversationInstance {
     });
 
     this.proc.stdin!.on('error', (err) => {
+      const cur = getState(this.instanceId);
       this.tearDownChild(err);
-      this.onError(err);
+      if (cur === 'spawning') {
+        this.rejectReady(err);
+      } else {
+        this.safeEmitError(err);
+      }
       this.destroy();
+      // 'exit' may not fire after 'error' (Node docs); self-unregister.
+      unregister(this.instanceId);
     });
 
     this.proc.on('exit', (code) => {
       const exitMessage = `Process exited with code ${code}`;
       const exitError = new Error(exitMessage);
-      const wasBusy = this.busy;
-      this.tearDownChild(exitError);
+      const cur = getState(this.instanceId);
+      const wasBusy = cur === 'busy';
+      const wasSpawning = cur === 'spawning';
 
-      if (wasBusy) {
-        this.onError(exitError);
+      this.tearDownChild(exitError);
+      setExitCodeFor(this.instanceId, code);
+
+      if (wasSpawning) {
+        this.rejectReady(exitError);
+      } else if (wasBusy) {
+        this.safeEmitError(exitError);
       }
       unregister(this.instanceId);
-      this.onExit(code);
     });
 
     this.proc.on('error', (err) => {
+      const cur = getState(this.instanceId);
       this.tearDownChild(err);
-      this.onError(err);
+      if (cur === 'spawning') {
+        this.rejectReady(err);
+      } else {
+        this.safeEmitError(err);
+      }
       this.destroy();
+      // 'exit' may not fire after 'error' (Node docs); self-unregister.
+      unregister(this.instanceId);
     });
 
-    // Self-register after spawn wiring is complete and before any user
-    // callback can fire. Placing this after spawn ensures a failing spawn
-    // (synchronous throw) never leaks an entry.
     register({
       instance: this,
       provider: 'codex',
@@ -152,30 +176,45 @@ export class CodexCLIWrapper implements AIConversationInstance {
       meta: undefined,
     });
 
-    // 4. Start initialization sequence
     this.initialize();
+  }
+
+  private safeEmitError(err: Error): void {
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', err);
+    }
   }
 
   private async initialize(): Promise<void> {
     try {
-      // Step 1: Send initialize
       await this.sendJsonRpcRequest('initialize', {
         clientInfo: { name: 'daphnis', title: 'Daphnis', version: '1.0.0' },
         capabilities: { experimentalApi: true },
       });
 
-      // Step 2: Send thread/start or thread/resume
       const threadMethod = this.resumeSessionId ? 'thread/resume' : 'thread/start';
       const threadParams = this.resumeSessionId ? { threadId: this.resumeSessionId } : {};
       const threadResult = await this.sendJsonRpcRequest(threadMethod, threadParams) as
         { thread: { id: string } };
       this.threadId = threadResult.thread.id;
-      this.ready = true;
-      emitReady(this.instanceId);
-      this.onReady();
+      transitionState(this.instanceId, 'ready');
+      this.resolveReady();
     } catch (err) {
-      this.onError(err instanceof Error ? err : new Error(String(err)));
+      const e = err instanceof Error ? err : new Error(String(err));
+      const cur = getState(this.instanceId);
+      if (cur === 'spawning') {
+        this.rejectReady(e);
+        if (getState(this.instanceId) !== 'exiting') {
+          transitionState(this.instanceId, 'exiting');
+        }
+      } else if (cur !== 'exiting') {
+        this.safeEmitError(e);
+      }
       this.destroy();
+      // Self-unregister: handshake failure may not produce a proc 'exit'
+      // synchronously (the child is alive until our scheduled SIGKILL).
+      // Subsequent proc.on('exit')/'error' will hit the silent no-op.
+      unregister(this.instanceId);
     }
   }
 
@@ -208,7 +247,6 @@ export class CodexCLIWrapper implements AIConversationInstance {
     const hasError = 'error' in msg;
     const hasMethod = 'method' in msg;
 
-    // JSON-RPC response (has id + result/error, no method)
     if (hasId && (hasResult || hasError) && !hasMethod) {
       const id = msg['id'] as number;
       const pending = this.pendingRequests.get(id);
@@ -224,13 +262,11 @@ export class CodexCLIWrapper implements AIConversationInstance {
       return;
     }
 
-    // Server-initiated request (has method + id, no result/error)
     if (hasMethod && hasId && !hasResult && !hasError) {
       this.handleServerRequest(msg['method'] as string, msg['id'] as number, msg['params']);
       return;
     }
 
-    // Notification (has method, no id)
     if (hasMethod && !hasId) {
       this.handleNotification(msg['method'] as string, msg['params']);
       return;
@@ -251,9 +287,6 @@ export class CodexCLIWrapper implements AIConversationInstance {
         break;
 
       case 'item/permissions/requestApproval':
-        // Schema: PermissionsRequestApprovalResponse from codex app-server protocol.
-        // fileSystem.read/write are path arrays (null = not granted, [] would be empty grant).
-        // We grant the cwd as read+write scope. network.enabled: true. macos: all sub-permissions.
         response = JSON.stringify({
           jsonrpc: '2.0',
           id,
@@ -285,7 +318,6 @@ export class CodexCLIWrapper implements AIConversationInstance {
         break;
 
       default:
-        // Fail-closed: unknown request types get JSON-RPC error
         console.warn(`CodexCLIWrapper: unknown server request method "${method}"`);
         response = JSON.stringify({
           jsonrpc: '2.0',
@@ -310,7 +342,6 @@ export class CodexCLIWrapper implements AIConversationInstance {
       case 'thread/started':
       case 'turn/started':
       case 'item/completed':
-        // No-op
         break;
 
       case 'item/agentMessage/delta': {
@@ -320,15 +351,19 @@ export class CodexCLIWrapper implements AIConversationInstance {
       }
 
       case 'turn/completed': {
+        // Late terminator after teardown (destroy, exit, error path):
+        // state is 'exiting' (or unknown id → terminal fallback). Drop
+        // the notification silently — transitioning to 'ready' would be
+        // illegal, and emitting on a torn-down wrapper is a contract
+        // violation.
+        if (getState(this.instanceId) !== 'busy') return;
+
         const turn = p?.['turn'] as Record<string, unknown> | undefined;
         const status = turn?.['status'] as string | undefined;
 
-        // Reset state BEFORE callbacks — callbacks may synchronously call
-        // sendMessage (e.g. marker retry), which would fail with "Already
-        // processing" if busy is still true.
         const completedContent = this.turnBuffer;
         this.turnBuffer = '';
-        this.busy = false;
+        transitionState(this.instanceId, 'ready');
         this.currentTurnId = null;
 
         if (this.interrupting) {
@@ -343,10 +378,6 @@ export class CodexCLIWrapper implements AIConversationInstance {
             return;
           }
           if (status === 'completed') {
-            // Natural completion race: turn finished before the cancel
-            // landed. Push the assistant turn so getTranscript()
-            // (in-memory only) does not silently lose a successfully
-            // produced answer.
             resolveBusy?.();
             const assistantTurn: ConversationTurn = {
               role: 'assistant',
@@ -354,13 +385,13 @@ export class CodexCLIWrapper implements AIConversationInstance {
               timestamp: new Date(),
             };
             this.history.push(assistantTurn);
-            this.onConversation(assistantTurn);
-            this.onMessage(assistantTurn.content);
+            this.emit('conversation', assistantTurn);
+            this.emit('message', assistantTurn.content);
             return;
           }
           const err = new Error(`Turn failed with status: ${status ?? 'unknown'}`);
           rejectBusy?.(err);
-          this.onError(err);
+          this.safeEmitError(err);
           return;
         }
 
@@ -371,35 +402,26 @@ export class CodexCLIWrapper implements AIConversationInstance {
             timestamp: new Date(),
           };
           this.history.push(assistantTurn);
-          this.onConversation(assistantTurn);
-          this.onMessage(assistantTurn.content);
+          this.emit('conversation', assistantTurn);
+          this.emit('message', assistantTurn.content);
         } else {
-          this.onError(new Error(`Turn failed with status: ${status ?? 'unknown'}`));
+          this.safeEmitError(new Error(`Turn failed with status: ${status ?? 'unknown'}`));
         }
         break;
       }
 
       default:
-        // Forward compatibility — ignore unknown notifications
         break;
     }
   }
 
   async sendMessage(text: string): Promise<void> {
-    if (!this.ready) {
-      this.onError(new Error('Not ready'));
-      return;
-    }
-    if (this.busy) {
-      this.onError(new Error('Already processing'));
-      return;
-    }
-    if (this.destroyed) {
-      this.onError(new Error('Destroyed'));
-      return;
-    }
+    const cur = getState(this.instanceId);
+    if (cur === 'exiting') throw new Error('Destroyed');
+    if (cur === 'busy') throw new Error('Already processing');
+    if (cur !== 'ready') throw new Error('Not ready');
 
-    this.busy = true;
+    transitionState(this.instanceId, 'busy');
     this.turnBuffer = '';
 
     try {
@@ -424,10 +446,12 @@ export class CodexCLIWrapper implements AIConversationInstance {
         timestamp: new Date(),
       };
       this.history.push(userTurn);
-      this.onConversation(userTurn);
+      this.emit('conversation', userTurn);
     } catch (err) {
-      this.busy = false;
-      this.onError(err instanceof Error ? err : new Error(String(err)));
+      if (getState(this.instanceId) === 'busy') {
+        transitionState(this.instanceId, 'ready');
+      }
+      throw err instanceof Error ? err : new Error(String(err));
     }
   }
 
@@ -463,8 +487,9 @@ export class CodexCLIWrapper implements AIConversationInstance {
   }
 
   async interrupt(): Promise<void> {
-    if (this.destroyed) throw new Error('Destroyed');
-    if (!this.busy) throw new Error('Not busy');
+    const cur = getState(this.instanceId);
+    if (cur === 'exiting') throw new Error('Destroyed');
+    if (cur !== 'busy') throw new Error('Not busy');
     if (!this.threadId || !this.currentTurnId) {
       throw new Error('No active turn to interrupt');
     }
@@ -494,10 +519,15 @@ export class CodexCLIWrapper implements AIConversationInstance {
 
   /**
    * Reset all live state on external child death (stdin error, exit, or
-   * spawn error). Idempotent. Rejects pending JSON-RPC requests and any
-   * pending interrupt, clears turn-level state.
+   * spawn error). Idempotent. Transitions to 'exiting' on first call,
+   * rejects pending JSON-RPC requests and any pending interrupt, clears
+   * turn-level state. Does NOT unregister — each terminal handler does
+   * that itself.
    */
   private tearDownChild(err: Error): void {
+    if (getState(this.instanceId) !== 'exiting') {
+      transitionState(this.instanceId, 'exiting');
+    }
     for (const [id, pending] of this.pendingRequests) {
       pending.reject(err);
       this.pendingRequests.delete(id);
@@ -508,17 +538,18 @@ export class CodexCLIWrapper implements AIConversationInstance {
     this.busyClearedResolve = null;
     this.busyClearedReject = null;
     this.interrupting = false;
-    this.busy = false;
     this.currentTurnId = null;
     this.turnBuffer = '';
   }
 
   destroy(): void {
-    if (this.destroyed) return;
-    unregister(this.instanceId);
-    this.destroyed = true;
-
-    this.tearDownChild(new Error('Destroyed'));
+    if (this.terminationScheduled) return;
+    this.terminationScheduled = true;
+    const cur = getState(this.instanceId);
+    if (cur !== 'exiting') {
+      this.tearDownChild(new Error('Destroyed'));
+    }
+    if (cur === 'spawning') this.rejectReady(new Error('Destroyed'));
 
     try {
       this.proc.stdin!.end();
@@ -533,5 +564,6 @@ export class CodexCLIWrapper implements AIConversationInstance {
         // process may already be dead
       }
     }, 3000);
+    // unregister happens in proc.on('exit') — do NOT call here.
   }
 }

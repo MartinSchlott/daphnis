@@ -9,34 +9,44 @@ id: vu6ntxrwrntgs4n17elgj33u
 ## Open
 id: h6co89r6x8vq2ileek28kxyi
 
-### instance:state-changed event
-id: rvsugmwcbnufknm1ap39le8t
-priority: low
-
-Requires modelling an explicit state machine first
-(`spawning | ready | busy | exiting`). Today the wrappers only have
-`ready` / `busy` booleans without a single source of truth for transitions.
-Out of scope until the state model is decided. Once the states exist, the
-event fires on every transition with `{ prev, next }`.
-
 ## In Progress
 id: j1rji73h7kju0kjp3avcbqdm
 
 ## Done
 id: na2518i666ngoh9fwzsfkzuq
 
+### instance:state-changed event
+id: rvsugmwcbnufknm1ap39le8t
+priority: low
+
+Shipped together with the explicit state machine
+(`spawning | ready | busy | exiting`). `InstanceInfo` carries a
+required `state` field; the registry's `transitionState(id, next)`
+helper is the single mutation point and emits
+`instance:state-changed` with payload
+`[info: InstanceInfo, prev: InstanceState, next: InstanceState]` on
+every legal transition. Illegal transitions throw, same-state
+self-transitions and unknown ids are silent no-ops. `instance:ready`
+emission is folded into the same helper and fires only on
+`spawning → ready`; subsequent `busy → ready` transitions emit
+`instance:state-changed` without re-emitting `instance:ready`.
+Failure-ordering invariant: `state-changed → exiting` always fires
+before `instance:removed`.
+
 ### instance:ready event
 id: m550net7oica0f6h40e71rog
 priority: medium
 
-Fires when the wrapper transitions to `ready=true`. Claude: synchronously after
-`register` (the wrapper fires `onReady` immediately on construction). Codex:
-after the `thread/start` / `thread/resume` handshake completes and a thread id
-is captured.
+Fires on the `spawning → ready` transition (emission folded into the
+registry's `transitionState` helper). Claude: synchronously inside the
+constructor — after `instance:added`, before `createAIConversation()`
+returns. Codex: after the `thread/start` / `thread/resume` handshake
+completes and a thread id is captured. Subsequent `busy → ready`
+transitions emit `instance:state-changed` but **not** `instance:ready`.
 
-Payload: `InstanceInfo`. Requires a new emission point in each wrapper plus an
-entry in `InstanceEventMap`. Consumers who want "instance is usable" semantics
-get them without polling `getSessionId()` from `instance:added`.
+Payload: `InstanceInfo`. Consumers who want "instance is usable"
+semantics get them without polling `getSessionId()` from
+`instance:added`.
 
 ### instance:meta-changed event
 id: cpc29053sk678m4mh2t1obol

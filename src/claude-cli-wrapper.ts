@@ -1,10 +1,15 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import type { AIConversationInstance, AIConversationHandlers, ConversationTurn, Effort } from './types.js';
+import { EventEmitter } from 'node:events';
+import type { AIConversationInstance, ConversationTurn, Effort, InstanceMessageEventMap } from './types.js';
 import { NdjsonParser } from './ndjson-parser.js';
 import { effortToClaudeFlag } from './effort-mapping.js';
 import { loadSessionHistory } from './sessions.js';
-import { register, unregister, setMetaFor, getMetaFor, emitReady } from './registry.js';
+import {
+  register, unregister, setMetaFor, getMetaFor,
+  setExitCodeFor, transitionState, getState,
+  type InstanceState,
+} from './registry.js';
 
 const ENV_BLACKLIST = new Set([
   'NODE_OPTIONS',
@@ -25,16 +30,16 @@ function filterEnv(): Record<string, string> {
   return result;
 }
 
-export class ClaudeCLIWrapper implements AIConversationInstance {
+export class ClaudeCLIWrapper
+  extends EventEmitter<InstanceMessageEventMap>
+  implements AIConversationInstance
+{
   private proc: ChildProcess;
   private readonly cwd: string;
   private readonly instanceId: string;
   private sessionId: string | null = null;
   private readonly resumeSessionId: string | null;
   private history: ConversationTurn[] = [];
-  private ready = false;
-  private busy = false;
-  private destroyed = false;
   private stderrBuffer = '';
   private historyLoadPromise: Promise<void> | null = null;
   private pendingControlRequests = new Map<string, { resolve: () => void; reject: (e: Error) => void }>();
@@ -42,45 +47,45 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
   private busyClearedResolve: (() => void) | null = null;
   private busyClearedReject: ((e: Error) => void) | null = null;
 
-  // Mutable callbacks
-  onReady: () => void;
-  onExit: (exitCode: number | null) => void;
-  onError: (error: Error) => void;
-  onMessage: (text: string) => void;
-  onConversation: (turn: ConversationTurn) => void;
+  readonly ready: Promise<void>;
+  private resolveReady!: () => void;
+  private rejectReady!: (err: Error) => void;
+
+  get state(): InstanceState {
+    return getState(this.instanceId);
+  }
 
   constructor(
     binary: string, cwd: string, instanceId: string,
-    handlers?: AIConversationHandlers,
     systemPrompt?: string, sessionId?: string, effort?: Effort, model?: string,
     envExtra?: Record<string, string>,
     fullAccess?: boolean, extraArgs?: string[],
   ) {
+    super();
     this.cwd = cwd;
     this.instanceId = instanceId;
     this.resumeSessionId = sessionId ?? null;
 
-    // 1. Set no-op defaults
-    this.onReady = handlers?.onReady ?? (() => {});
-    this.onExit = handlers?.onExit ?? (() => {});
-    this.onError = handlers?.onError ?? (() => {});
-    this.onMessage = handlers?.onMessage ?? (() => {});
-    this.onConversation = handlers?.onConversation ?? (() => {});
+    this.ready = new Promise<void>((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
+    // Swallow unhandled-rejection if no one awaits ready.
+    this.ready.catch(() => {});
 
-    // 2. Create NDJSON parser
     const parser = new NdjsonParser({
       onParsed: (obj) => this.handleParsed(obj),
       onError: (_line, error) => {
-        this.onError(new Error(`NDJSON parse error: ${error.message}`));
+        const wrapped = new Error(`NDJSON parse error: ${error.message}`);
+        if (getState(this.instanceId) === 'spawning') {
+          this.rejectReady(wrapped);
+        } else {
+          this.safeEmitError(wrapped);
+        }
         this.destroy();
       },
     });
 
-    // 3. Spawn process (after handlers are wired)
-    // --print is required: stream-json formats only work in non-interactive mode.
-    // The system/init event is emitted after the first user message is written to
-    // stdin, so we set ready immediately after spawn and capture the session_id
-    // asynchronously when the init event arrives.
     if (sessionId) {
       this.sessionId = sessionId;
     }
@@ -128,8 +133,18 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
     this.proc.stdin!.on('error', (err) => {
       this.rejectPendingControl(err);
       this.failPendingInterrupt(err);
-      this.onError(err);
+      const cur = getState(this.instanceId);
+      if (cur === 'spawning') {
+        this.rejectReady(err);
+      } else {
+        this.safeEmitError(err);
+      }
+      // destroy() handles transition→exiting and the SIGKILL timer in every
+      // branch — including spawning, where leaving the child alive would
+      // orphan the process.
       this.destroy();
+      // 'exit' may not fire after 'error' (Node docs); self-unregister.
+      unregister(this.instanceId);
     });
 
     this.proc.on('exit', (code) => {
@@ -142,25 +157,33 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
       this.rejectPendingControl(exitError);
       this.failPendingInterrupt(exitError);
 
-      if (this.busy) {
-        this.busy = false;
-        this.onError(exitError);
-        this.destroy();
+      const cur = getState(this.instanceId);
+      if (cur === 'spawning') {
+        this.rejectReady(exitError);
+      } else if (cur === 'busy') {
+        this.safeEmitError(exitError);
       }
+      if (cur !== 'exiting') {
+        transitionState(this.instanceId, 'exiting');
+      }
+      setExitCodeFor(this.instanceId, code);
       unregister(this.instanceId);
-      this.onExit(code);
     });
 
     this.proc.on('error', (err) => {
       this.rejectPendingControl(err);
       this.failPendingInterrupt(err);
-      this.onError(err);
+      const cur = getState(this.instanceId);
+      if (cur === 'spawning') {
+        this.rejectReady(err);
+      } else {
+        this.safeEmitError(err);
+      }
       this.destroy();
+      // 'exit' may not fire after 'error' (Node docs); self-unregister.
+      unregister(this.instanceId);
     });
 
-    // Self-register after spawn wiring is complete and before any user
-    // callback can fire (onReady at end of ctor). Placing this after spawn
-    // ensures a failing spawn (synchronous throw) never leaks an entry.
     register({
       instance: this,
       provider: 'claude',
@@ -169,11 +192,21 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
       meta: undefined,
     });
 
-    // Ready immediately — the CLI is alive and accepts stdin. The system/init
-    // event only arrives after the first user message, so we cannot wait for it.
-    this.ready = true;
-    emitReady(this.instanceId);
-    this.onReady();
+    // Defer ready transition past nextTick + microtasks so that any
+    // process.nextTick-emitted spawn 'error' (e.g. ENOENT) wins the race
+    // and rejects ready before this transition can fire.
+    setImmediate(() => {
+      if (getState(this.instanceId) === 'spawning') {
+        transitionState(this.instanceId, 'ready');
+        this.resolveReady();
+      }
+    });
+  }
+
+  private safeEmitError(err: Error): void {
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', err);
+    }
   }
 
   private handleParsed(obj: unknown): void {
@@ -200,22 +233,26 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
       case 'system': {
         const subtype = (msg['subtype'] as string) ?? '';
         if (subtype === 'init') {
-          // Capture session_id when it arrives (after first user message).
-          // ready + onReady already fired in constructor.
           this.sessionId = (msg['session_id'] as string) ?? null;
         }
         break;
       }
       case 'result': {
+        // Late terminator after teardown (destroy, exit, error path):
+        // state is 'exiting' (or unknown id → terminal fallback). Drop
+        // the result silently — transitioning to 'ready' would be illegal,
+        // and emitting on a torn-down wrapper is a contract violation.
+        if (getState(this.instanceId) !== 'busy') return;
+
         const isError = msg['is_error'] === true;
         const subtype = msg['subtype'] as string | undefined;
         const resultText = typeof msg['result'] === 'string' ? msg['result'] : '';
         const isInterruptTerminator = isError && subtype === 'error_during_execution';
 
-        // Reset busy BEFORE callbacks — callbacks may synchronously call
-        // sendMessage (e.g. marker retry), which would fail with "Already
-        // processing" if busy is still true.
-        this.busy = false;
+        // Reset state BEFORE callbacks — listeners may synchronously call
+        // sendMessage, which would fail with "Already processing" if state
+        // is still busy.
+        transitionState(this.instanceId, 'ready');
 
         if (this.interrupting) {
           this.interrupting = false;
@@ -231,12 +268,10 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
           if (isError) {
             const err = new Error(resultText);
             rejectBusy?.(err);
-            this.onError(err);
+            this.safeEmitError(err);
             return;
           }
           // Natural completion race: turn finished before the cancel landed.
-          // Push the assistant turn so getTranscript() (in-memory only) does
-          // not silently lose a successfully produced answer.
           resolveBusy?.();
           const turn: ConversationTurn = {
             role: 'assistant',
@@ -244,13 +279,13 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
             timestamp: new Date(),
           };
           this.history.push(turn);
-          this.onConversation(turn);
-          this.onMessage(turn.content);
+          this.emit('conversation', turn);
+          this.emit('message', turn.content);
           return;
         }
 
         if (isError) {
-          this.onError(new Error(resultText));
+          this.safeEmitError(new Error(resultText));
         } else {
           const turn: ConversationTurn = {
             role: 'assistant',
@@ -258,8 +293,8 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
             timestamp: new Date(),
           };
           this.history.push(turn);
-          this.onConversation(turn);
-          this.onMessage(turn.content);
+          this.emit('conversation', turn);
+          this.emit('message', turn.content);
         }
         break;
       }
@@ -288,19 +323,13 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
     this.interrupting = false;
   }
 
-  sendMessage(text: string): void {
-    if (!this.ready) {
-      this.onError(new Error('Not ready'));
-      return;
-    }
-    if (this.busy) {
-      this.onError(new Error('Already processing'));
-      return;
-    }
-    if (this.destroyed) {
-      this.onError(new Error('Destroyed'));
-      return;
-    }
+  async sendMessage(text: string): Promise<void> {
+    const cur = getState(this.instanceId);
+    // Order matters: 'exiting' first so a destroyed-while-busy wrapper
+    // reports 'Destroyed', not 'Already processing'.
+    if (cur === 'exiting') throw new Error('Destroyed');
+    if (cur === 'busy') throw new Error('Already processing');
+    if (cur !== 'ready') throw new Error('Not ready');
 
     const message = JSON.stringify({
       type: 'user',
@@ -309,25 +338,26 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
       parent_tool_use_id: null,
     });
 
-    this.busy = true;
-    const ok = this.proc.stdin!.write(message + '\n', (err) => {
-      if (err) {
-        this.busy = false;
-        this.onError(err);
-        return;
-      }
-      const turn: ConversationTurn = {
-        role: 'user',
-        content: text,
-        timestamp: new Date(),
-      };
-      this.history.push(turn);
-      this.onConversation(turn);
+    transitionState(this.instanceId, 'busy');
+    return new Promise<void>((resolve, reject) => {
+      this.proc.stdin!.write(message + '\n', (err) => {
+        if (err) {
+          if (getState(this.instanceId) === 'busy') {
+            transitionState(this.instanceId, 'ready');
+          }
+          reject(err);
+          return;
+        }
+        const turn: ConversationTurn = {
+          role: 'user',
+          content: text,
+          timestamp: new Date(),
+        };
+        this.history.push(turn);
+        this.emit('conversation', turn);
+        resolve();
+      });
     });
-    if (!ok) {
-      // Backpressure — the callback will still fire, so no action needed here.
-      // The turn is only committed once the write callback confirms delivery.
-    }
   }
 
   async getTranscript(): Promise<ConversationTurn[]> {
@@ -362,8 +392,9 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
   }
 
   async interrupt(): Promise<void> {
-    if (this.destroyed) throw new Error('Destroyed');
-    if (!this.busy) throw new Error('Not busy');
+    const cur = getState(this.instanceId);
+    if (cur === 'exiting') throw new Error('Destroyed');
+    if (cur !== 'busy') throw new Error('Not busy');
     if (this.interrupting) throw new Error('Interrupt already in progress');
     this.interrupting = true;
 
@@ -396,13 +427,14 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
   }
 
   destroy(): void {
-    if (this.destroyed) return;
-    unregister(this.instanceId);
-    this.destroyed = true;
+    const cur = getState(this.instanceId);
+    if (cur === 'exiting') return;
+    transitionState(this.instanceId, 'exiting');
 
     const destroyedErr = new Error('Destroyed');
     this.rejectPendingControl(destroyedErr);
     this.failPendingInterrupt(destroyedErr);
+    if (cur === 'spawning') this.rejectReady(destroyedErr);
 
     try {
       this.proc.stdin!.end();
@@ -417,5 +449,6 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
         // process may already be dead
       }
     }, 3000);
+    // unregister happens in proc.on('exit') — do NOT call here.
   }
 }

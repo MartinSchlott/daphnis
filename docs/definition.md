@@ -7,7 +7,7 @@ Claude CLI and OpenAI Codex CLI. It exposes a single, small surface for two
 use cases:
 
 - **Persistent conversation** — spawn a CLI, send messages, receive streamed
-  replies, resume prior sessions, retrieve transcripts.
+  replies via per-instance events, resume prior sessions, retrieve transcripts.
 - **One-shot prompting** — run a single prompt, optionally schema-enforced,
   with timeout and cancellation.
 
@@ -32,9 +32,13 @@ cannot be modelled without compromise is out of scope.
 
 ### In scope
 
-- `createAIConversation(options)` — persistent session with streaming
-  callbacks, resume by session id, transcript retrieval, and turn-level
-  cancellation (`interrupt()`).
+- `createAIConversation(options)` — persistent session. Returns an
+  `AIConversationInstance` that is itself a typed `EventEmitter` exposing
+  `'message'`, `'conversation'`, and `'error'` events. `inst.ready` is a
+  `Promise<void>` that resolves when the wrapper is usable (or rejects on
+  spawn / handshake failure). `inst.sendMessage(text)` is uniformly async
+  and returns `Promise<void>`. Supports resume by session id, transcript
+  retrieval, and turn-level cancellation (`interrupt()`).
 - `runOneShotPrompt(options)` — single-shot prompt with optional JSON
   schema, timeout, and `AbortSignal` cancellation.
 - `listSessions(provider, cwd)` — enumerate persisted sessions for the
@@ -44,9 +48,13 @@ cannot be modelled without compromise is out of scope.
   `getMeta<T>()` let callers hang an opaque payload on an instance and
   look it up without keeping their own map.
   - `instanceEvents` — typed `EventEmitter<InstanceEventMap>` exposing
-    `instance:added`, `instance:removed`, `instance:ready`, and
-    `instance:meta-changed`. Subscribers see lifecycle transitions and
-    meta updates without polling `listInstances()` / `getSessionId()`.
+    `instance:added`, `instance:removed`, `instance:ready`,
+    `instance:meta-changed`, and `instance:state-changed`. Subscribers
+    see lifecycle transitions and meta updates without polling
+    `listInstances()` / `getSessionId()`. `InstanceInfo.state` carries
+    the current lifecycle state (`spawning | ready | busy | exiting`),
+    and `InstanceInfo.exitCode` carries the child's exit code (`null`
+    until the child has actually exited).
 - Uniform effort levels (`default | min | low | medium | high | xhigh |
   max`) mapped to the closest provider-supported gear.
 - Uniform `ConversationTurn` shape (`role`, `content`, `timestamp`).

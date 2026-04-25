@@ -74,15 +74,12 @@ describe('createAIConversation', () => {
     expect(mockSpawn).toHaveBeenCalledWith('codex', expect.any(Array), expect.any(Object));
   });
 
-  it('passes handlers to the constructor', () => {
+  it('returns a wrapper whose ready promise resolves', async () => {
     const fakeProc = createFakeProcess();
     mockSpawn.mockReturnValue(fakeProc);
-    const onReady = vi.fn();
-    createAIConversation({ provider: 'claude', cwd: '/tmp', handlers: { onReady } });
+    const instance = createAIConversation({ provider: 'claude', cwd: '/tmp' });
 
-    // Feed system/init to verify handler was wired
-    fakeProc.stdout.push(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'test' }) + '\n');
-    expect(onReady).toHaveBeenCalledOnce();
+    await expect(instance.ready).resolves.toBeUndefined();
   });
 
   it('throws for unknown provider', () => {

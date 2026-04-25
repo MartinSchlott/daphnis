@@ -1,27 +1,24 @@
+import type { EventEmitter } from 'node:events';
+import type { InstanceState } from './registry.js';
+
 export interface ConversationTurn {
   role: 'user' | 'assistant';
   content: string;
   timestamp: Date;
 }
 
-export interface AIConversationHandlers {
-  onReady?: () => void;
-  onMessage?: (text: string) => void;
-  onConversation?: (turn: ConversationTurn) => void;
-  onError?: (error: Error) => void;
-  onExit?: (exitCode: number | null) => void;
+export interface InstanceMessageEventMap {
+  message:      [text: string];
+  conversation: [turn: ConversationTurn];
+  error:        [err: Error];
 }
 
-export interface AIConversationInstance {
-  // Lifecycle
-  onReady: () => void;
-  onExit: (exitCode: number | null) => void;
-  onError: (error: Error) => void;
-  destroy: () => void;
+export interface AIConversationInstance
+  extends EventEmitter<InstanceMessageEventMap> {
+  readonly ready: Promise<void>;
+  readonly state: InstanceState;
 
-  // Communication
-  sendMessage: (text: string) => void;
-  onMessage: (text: string) => void;
+  sendMessage(text: string): Promise<void>;
 
   /**
    * Cancel the in-flight turn while keeping the session alive. Resolves once
@@ -34,33 +31,26 @@ export interface AIConversationInstance {
    * Rejects when not busy, when destroyed, when an interrupt is already in
    * progress, when the provider's ack carries an error, when the child
    * exits/errors before the cancel completes, or when the in-flight turn
-   * fails for a reason unrelated to the cancel — `onError` still fires in
-   * that last case and `interrupt()` rejects with the same error.
+   * fails for a reason unrelated to the cancel — the `error` event still
+   * fires in that last case and `interrupt()` rejects with the same error.
    *
    * History semantics: the in-memory user turn of the cancelled exchange is
    * retained. If the cancel actually interrupted the turn, no assistant
    * turn is appended. If the turn finished naturally during the cancel
-   * race, the assistant turn IS appended and the normal `onMessage` /
-   * `onConversation` callbacks fire — `getTranscript()` is in-memory only,
+   * race, the assistant turn IS appended and the normal `message` /
+   * `conversation` events fire — `getTranscript()` is in-memory only,
    * so silently dropping a successfully produced answer would erase it.
    */
-  interrupt: () => Promise<void>;
+  interrupt(): Promise<void>;
+  destroy(): void;
 
-  // History
-  onConversation: (turn: ConversationTurn) => void;
-  getTranscript: () => Promise<ConversationTurn[]>;
-
-  // Session identity
-  getSessionId: () => string | null;
-
-  // Process identity
-  getPid: () => number;
-
-  // Registry identity & metadata
-  getInstanceId: () => string;
-  setMeta: (value: unknown) => void;
+  getTranscript(): Promise<ConversationTurn[]>;
+  getSessionId(): string | null;
+  getPid(): number;
+  getInstanceId(): string;
+  setMeta(value: unknown): void;
   /** Unchecked cast — the registry stores meta as `unknown`. */
-  getMeta: <T = unknown>() => T | undefined;
+  getMeta<T = unknown>(): T | undefined;
 }
 
 /**
@@ -73,7 +63,6 @@ export type Effort = 'default' | 'min' | 'low' | 'medium' | 'high' | 'xhigh' | '
 export interface AIConversationOptions {
   provider: 'claude' | 'codex';
   cwd: string;
-  handlers?: AIConversationHandlers;
   /** Path to the provider binary. Defaults to 'claude' or 'codex' (resolved via PATH). */
   binary?: string;
   /** System prompt / developer instructions passed to the AI agent. */

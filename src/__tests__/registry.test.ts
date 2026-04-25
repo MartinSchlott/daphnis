@@ -1,13 +1,17 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import type { AIConversationInstance } from '../types.js';
+import { EventEmitter } from 'node:events';
+import type { AIConversationInstance, InstanceMessageEventMap } from '../types.js';
 import {
   register,
   unregister,
   setMetaFor,
   getMetaFor,
+  setExitCodeFor,
+  getState,
   listInstances,
   getInstance,
   instanceEvents,
+  transitionState,
   __resetForTests,
 } from '../registry.js';
 
@@ -21,22 +25,20 @@ function makeFake(overrides: FakeOverrides = {}): AIConversationInstance {
   const id = overrides.id ?? 'fake-id';
   const sessionId = overrides.sessionId ?? null;
   const pid = overrides.pid ?? 42;
-  return {
-    onReady: () => {},
-    onExit: () => {},
-    onError: () => {},
-    destroy: () => {},
-    sendMessage: () => {},
-    onMessage: () => {},
+  const emitter = new EventEmitter<InstanceMessageEventMap>();
+  return Object.assign(emitter, {
+    ready: Promise.resolve(),
+    state: 'spawning' as const,
+    sendMessage: async () => {},
     interrupt: async () => {},
-    onConversation: () => {},
+    destroy: () => {},
     getTranscript: async () => [],
     getSessionId: () => sessionId,
     getPid: () => pid,
     getInstanceId: () => id,
     setMeta: () => {},
-    getMeta: () => undefined,
-  };
+    getMeta: <T = unknown>() => undefined as T | undefined,
+  }) as unknown as AIConversationInstance;
 }
 
 describe('registry', () => {
@@ -65,8 +67,46 @@ describe('registry', () => {
       pid: 111,
       createdAt,
       meta: undefined,
+      state: 'spawning',
+      exitCode: null,
     });
     expect(getInstance('a')).toBe(fake);
+  });
+
+  it('register initializes exitCode to null', () => {
+    const fake = makeFake({ id: 'init-ec' });
+    register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+    expect(listInstances()[0].exitCode).toBeNull();
+  });
+
+  it('setExitCodeFor updates exitCode visible on the next instance:removed snapshot', () => {
+    const fake = makeFake({ id: 'ec' });
+    register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+    transitionState('ec', 'exiting');
+    setExitCodeFor('ec', 1);
+
+    const removed = vi.fn();
+    instanceEvents.on('instance:removed', removed);
+    unregister('ec');
+
+    expect(removed).toHaveBeenCalledOnce();
+    expect(removed.mock.calls[0][0].exitCode).toBe(1);
+  });
+
+  it('setExitCodeFor on unknown id is a silent no-op', () => {
+    expect(() => setExitCodeFor('nope', 0)).not.toThrow();
+  });
+
+  it('getState returns the current state for a known id', () => {
+    const fake = makeFake({ id: 'gs' });
+    register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+    expect(getState('gs')).toBe('spawning');
+    transitionState('gs', 'ready');
+    expect(getState('gs')).toBe('ready');
+  });
+
+  it("getState returns 'exiting' for an unknown id (terminal fallback)", () => {
+    expect(getState('does-not-exist')).toBe('exiting');
   });
 
   it('setMetaFor updates the meta slot visible in DTO and getMetaFor', () => {
@@ -87,16 +127,26 @@ describe('registry', () => {
     expect(getMetaFor('c')).toEqual({ b: 2 });
   });
 
-  it('unregister removes the entry and is idempotent', () => {
+  it("unregister throws when state is not 'exiting'", () => {
     const fake = makeFake({ id: 'd' });
     register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
 
-    unregister('d');
-    expect(getInstance('d')).toBeUndefined();
+    expect(() => unregister('d')).toThrow(/must be exiting/);
+    // Entry still present
+    expect(listInstances()).toHaveLength(1);
+  });
+
+  it("unregister succeeds and is idempotent once state is 'exiting'", () => {
+    const fake = makeFake({ id: 'd2' });
+    register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+    transitionState('d2', 'exiting');
+
+    unregister('d2');
+    expect(getInstance('d2')).toBeUndefined();
     expect(listInstances()).toHaveLength(0);
 
-    // Second call is a no-op
-    unregister('d');
+    // Second call (unknown id) is a silent no-op
+    expect(() => unregister('d2')).not.toThrow();
     expect(listInstances()).toHaveLength(0);
   });
 
@@ -136,6 +186,8 @@ describe('registry', () => {
         pid: 111,
         createdAt,
         meta: { tag: 't' },
+        state: 'spawning',
+        exitCode: null,
       });
     });
 
@@ -145,6 +197,7 @@ describe('registry', () => {
       register({ instance: fake, provider: 'codex', cwd: '/w', createdAt, meta: undefined });
 
       setMetaFor('b', { last: true });
+      transitionState('b', 'exiting');
 
       const listener = vi.fn();
       instanceEvents.on('instance:removed', listener);
@@ -160,6 +213,8 @@ describe('registry', () => {
         pid: 222,
         createdAt,
         meta: { last: true },
+        state: 'exiting',
+        exitCode: null,
       });
     });
 
@@ -186,6 +241,7 @@ describe('registry', () => {
     it('second unregister for the same id fires no second removed event', () => {
       const fake = makeFake({ id: 'd' });
       register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+      transitionState('d', 'exiting');
 
       const listener = vi.fn();
       instanceEvents.on('instance:removed', listener);
@@ -223,22 +279,20 @@ describe('registry', () => {
 
     it('snapshot stability: payload is a value, not a live view of the instance', () => {
       let session: string | null = 'initial';
-      const fake: AIConversationInstance = {
-        onReady: () => {},
-        onExit: () => {},
-        onError: () => {},
-        destroy: () => {},
-        sendMessage: () => {},
-        onMessage: () => {},
+      const emitter = new EventEmitter<InstanceMessageEventMap>();
+      const fake = Object.assign(emitter, {
+        ready: Promise.resolve(),
+        state: 'spawning' as const,
+        sendMessage: async () => {},
         interrupt: async () => {},
-        onConversation: () => {},
+        destroy: () => {},
         getTranscript: async () => [],
         getSessionId: () => session,
         getPid: () => 99,
         getInstanceId: () => 'g',
         setMeta: () => {},
-        getMeta: () => undefined,
-      };
+        getMeta: <T = unknown>() => undefined as T | undefined,
+      }) as unknown as AIConversationInstance;
 
       let captured: { sessionId: string | null } | undefined;
       instanceEvents.on('instance:added', info => {
@@ -283,6 +337,8 @@ describe('registry', () => {
         pid: 333,
         createdAt,
         meta: { v: 2 },
+        state: 'spawning',
+        exitCode: null,
       });
       expect(prev).toEqual({ v: 1 });
     });
@@ -318,6 +374,151 @@ describe('registry', () => {
       register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: { initial: true } });
 
       expect(listener).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('state machine', () => {
+    it("initial state on register is 'spawning'", () => {
+      const added = vi.fn();
+      instanceEvents.on('instance:added', added);
+
+      const fake = makeFake({ id: 's1' });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+
+      expect(added).toHaveBeenCalledOnce();
+      expect(added.mock.calls[0][0].state).toBe('spawning');
+    });
+
+    it("transitionState updates entry.state and emits 'instance:state-changed' with [info, prev, next]", () => {
+      const fake = makeFake({ id: 's2' });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+
+      const listener = vi.fn();
+      instanceEvents.on('instance:state-changed', listener);
+
+      transitionState('s2', 'ready');
+
+      expect(listener).toHaveBeenCalledOnce();
+      const call = listener.mock.calls[0];
+      expect(call).toHaveLength(3);
+      const [info, prev, next] = call;
+      expect(prev).toBe('spawning');
+      expect(next).toBe('ready');
+      expect(info.state).toBe('ready');
+      expect(info.id).toBe('s2');
+      expect(listInstances()[0].state).toBe('ready');
+    });
+
+    it("'spawning → ready' also emits 'instance:ready'", () => {
+      const fake = makeFake({ id: 's3' });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+
+      const ready = vi.fn();
+      const stateChanged = vi.fn();
+      instanceEvents.on('instance:ready', ready);
+      instanceEvents.on('instance:state-changed', stateChanged);
+
+      transitionState('s3', 'ready');
+
+      expect(stateChanged).toHaveBeenCalledOnce();
+      expect(ready).toHaveBeenCalledOnce();
+      expect(ready.mock.calls[0][0].state).toBe('ready');
+    });
+
+    it("'busy → ready' does NOT emit 'instance:ready'", () => {
+      const fake = makeFake({ id: 's4' });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+
+      const ready = vi.fn();
+      instanceEvents.on('instance:ready', ready);
+
+      transitionState('s4', 'ready');
+      transitionState('s4', 'busy');
+      transitionState('s4', 'ready');
+
+      expect(ready).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      ['spawning', 'busy'],
+      ['ready', 'spawning'],
+      ['busy', 'spawning'],
+    ] as const)('illegal transition %s → %s throws and does not emit', (from, to) => {
+      const fake = makeFake({ id: `il-${from}-${to}` });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+
+      if (from === 'ready') {
+        transitionState(`il-${from}-${to}`, 'ready');
+      } else if (from === 'busy') {
+        transitionState(`il-${from}-${to}`, 'ready');
+        transitionState(`il-${from}-${to}`, 'busy');
+      }
+
+      const stateChanged = vi.fn();
+      instanceEvents.on('instance:state-changed', stateChanged);
+
+      expect(() => transitionState(`il-${from}-${to}`, to)).toThrow(/Illegal state transition/);
+      expect(stateChanged).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['ready'],
+      ['busy'],
+      ['spawning'],
+    ] as const)("transitions out of 'exiting' to %s throw", (target) => {
+      const fake = makeFake({ id: `ex-${target}` });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+      transitionState(`ex-${target}`, 'exiting');
+
+      const stateChanged = vi.fn();
+      instanceEvents.on('instance:state-changed', stateChanged);
+
+      expect(() => transitionState(`ex-${target}`, target)).toThrow(/Illegal state transition/);
+      expect(stateChanged).not.toHaveBeenCalled();
+    });
+
+    it('same-state self-transition is a no-op (no event, no throw)', () => {
+      const fake = makeFake({ id: 'self' });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+      transitionState('self', 'ready');
+
+      const stateChanged = vi.fn();
+      instanceEvents.on('instance:state-changed', stateChanged);
+
+      expect(() => transitionState('self', 'ready')).not.toThrow();
+      expect(stateChanged).not.toHaveBeenCalled();
+    });
+
+    it('unknown id is a silent no-op (no throw, no event)', () => {
+      const stateChanged = vi.fn();
+      instanceEvents.on('instance:state-changed', stateChanged);
+
+      expect(() => transitionState('does-not-exist', 'ready')).not.toThrow();
+      expect(stateChanged).not.toHaveBeenCalled();
+    });
+
+    it("unregister payload reflects current state ('exiting' after a full lifecycle)", () => {
+      const fake = makeFake({ id: 'lc' });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+      transitionState('lc', 'ready');
+      transitionState('lc', 'busy');
+      transitionState('lc', 'exiting');
+
+      const removed = vi.fn();
+      instanceEvents.on('instance:removed', removed);
+
+      unregister('lc');
+
+      expect(removed).toHaveBeenCalledOnce();
+      expect(removed.mock.calls[0][0].state).toBe('exiting');
+    });
+
+    it('InstanceInfo.state round-trips through listInstances()', () => {
+      const fake = makeFake({ id: 'rt' });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+      transitionState('rt', 'ready');
+
+      expect(listInstances()[0].state).toBe('ready');
     });
   });
 });

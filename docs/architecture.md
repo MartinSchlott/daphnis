@@ -19,7 +19,7 @@
 daphnis/
 ├── src/
 │   ├── index.ts              # public API surface (exports only)
-│   ├── types.ts              # AIConversationInstance, Options, Handlers, Effort
+│   ├── types.ts              # AIConversationInstance (EventEmitter), Options, Effort
 │   ├── factory.ts            # createAIConversation → provider switch
 │   ├── claude-cli-wrapper.ts # persistent Claude session (stream-json)
 │   ├── codex-cli-wrapper.ts  # persistent Codex session (JSON-RPC app-server)
@@ -43,11 +43,11 @@ Flat layout, single package. No monorepo, no workspaces.
 `src/index.ts` re-exports exactly:
 
 - `createAIConversation` + `AIConversationInstance`, `AIConversationOptions`,
-  `AIConversationHandlers`, `ConversationTurn`, `Effort`
+  `ConversationTurn`, `Effort`, `InstanceMessageEventMap`
 - `runOneShotPrompt` + `OneShotOptions`, `OneShotResult`
 - `listSessions` + `SessionInfo`
 - `listInstances`, `getInstance`, `instanceEvents` + `InstanceInfo`,
-  `InstanceEventMap`
+  `InstanceEventMap`, `InstanceState`
 
 Nothing else is exported. Internal helpers (NDJSON parser, effort mapping)
 are implementation detail.
@@ -66,12 +66,25 @@ spawn claude --print --input-format stream-json
                    {"type":"control_request",...subtype:"interrupt"} for cancel
   ↑ stdout: NDJSON stream
       type=system/init       → capture session_id
-      type=result            → emit assistant turn, reset busy BEFORE callback
+      type=result            → emit assistant turn, reset busy BEFORE event
       type=control_response  → resolve/reject the matching interrupt() ack
 ```
 
-Ready fires immediately on spawn — the `system/init` event only arrives
-after the first user message, so we cannot wait for it.
+Claude's `--print` accepts stdin instantly, so the `spawning → ready`
+transition is scheduled via `setImmediate(...)` rather than fired
+synchronously. `setImmediate` runs in the check phase of the event loop,
+**after** the `process.nextTick` queue and the microtask queue have
+drained — so any `nextTick`-emitted spawn `'error'` (ENOENT and friends)
+deterministically wins the race and rejects `inst.ready` before the
+deferred ready transition can fire. The deferred callback re-checks
+`getState(id) === 'spawning'` and self-cancels if the error path already
+moved state to `'exiting'`. `queueMicrotask` would not be sufficient:
+caller contexts that sit between `createAIConversation()` returning and
+the listener attachment (top-level await, `await Promise.resolve()`,
+etc.) drain microtasks early and do not give the same ordering guarantee
+against `nextTick`. The `system/init` event only arrives after the first
+user message, so `getSessionId()` returns `null` (or the resumed id, if
+passed) until then.
 
 ### Persistent conversation (Codex)
 
@@ -90,8 +103,10 @@ spawn codex [global flags] app-server
       Server-initiated requests (approval, tool/call) auto-responded
 ```
 
-Codex requires an initialisation handshake. Ready only fires after
-`thread/start` / `thread/resume` returns a thread id.
+Codex requires an initialisation handshake. `inst.ready` resolves only
+after `thread/start` / `thread/resume` returns a thread id; on handshake
+failure it rejects with the JSON-RPC error and the wrapper transitions
+straight `spawning → exiting`.
 
 ### One-shot (Claude)
 
@@ -150,11 +165,12 @@ Line-buffered. Incomplete trailing line is retained across `feed()`
 calls. Parse errors propagate as fatal — a malformed line means the
 stream is corrupt.
 
-### Busy flag reset before callback
+### State reset to `'ready'` before message events fire
 
-Both wrappers reset `busy = false` *before* invoking `onConversation` /
-`onMessage`. Callbacks may synchronously call `sendMessage` (e.g. marker
-retry patterns, auto-dispatch); resetting after would fail with
+Both wrappers transition `busy → ready` (via the registry's
+`transitionState`) *before* emitting `'conversation'` / `'message'`.
+Listeners may synchronously call `sendMessage` (e.g. marker retry
+patterns, auto-dispatch); transitioning after would fail with
 "Already processing".
 
 ### One-shot resolves on `close`, not `exit`
@@ -219,26 +235,43 @@ instance produced by `createAIConversation`. The factory generates a
 `crypto.randomUUID()` id and hands it to the wrapper constructor.
 
 Registration happens *after* the child process is spawned and its
-`stdout`/`stderr`/`stdin`/`exit`/`error` listeners are wired, but still
-*before* any user callback can fire — i.e. before Claude's synchronous
-`onReady()` at the end of the constructor and before Codex's async
-`initialize()`. Placing it after `spawn(...)` ensures a synchronously
-throwing spawn cannot leak an entry.
+`stdout`/`stderr`/`stdin`/`exit`/`error` listeners are wired. Placing it
+after `spawn(...)` ensures a synchronously throwing spawn cannot leak an
+entry.
 
-Deregistration happens at three points, any of which is safe to run
-twice because `Map.delete` is idempotent:
+`unregister(id)` is invariant-tightened: it throws if the entry's state
+is not `'exiting'` at call time. This surfaces wrapper bugs at the
+source — every code path that ends an instance must transition to
+`'exiting'` first. Unknown id remains a silent no-op so the deregistration
+paths can fire defensively without coordination.
 
-- Inside `destroy()`, *synchronously* — before the `destroyed = true`
-  guard flips. Immediately after `destroy()` returns, the entry is gone.
-  Codex `initialize()` calls `this.destroy()` in its catch block after
-  `onError`, so a failed handshake does not leave a stale entry.
-- In the `proc.on('exit')` handler, *before* `onExit(code)` fires. A
-  caller inspecting `listInstances()` from inside `onExit` sees the
-  instance already gone.
-- In the `proc.on('error')` handler, via `this.destroy()` after
-  `onError`. Node does not guarantee an `exit` event when `spawn` emits
-  `error` (e.g. ENOENT), so without this path a missing binary would
-  leave a registry entry for a process that never lived.
+Deregistration paths:
+
+- `proc.on('exit')` — captures the previous state, then runs
+  `tearDownChild` (or, for Claude, transitions `→ exiting` inline),
+  calls `setExitCodeFor(id, code)` so the snapshot carries the real
+  exit code, and finally calls `unregister(id)`.
+- `proc.on('error')` and `stdin.on('error')` — Node does not guarantee
+  an `'exit'` event after an `'error'` (the classic ENOENT spawn-failure
+  case). The handlers therefore self-unregister defensively. Because
+  `setExitCodeFor` is only called from the `'exit'` handler, the
+  `instance:removed` snapshot in this case carries `exitCode: null` —
+  correct, since no real exit code exists.
+- Codex `initialize()` catch — handshake failure transitions to
+  `'exiting'` and self-unregisters directly (the child process is still
+  alive at this point; `destroy()` schedules a SIGKILL after 3 s, but
+  consumers should see the registry empty immediately, not after the
+  kill grace period).
+
+`destroy()` is non-blocking. It transitions the entry to `'exiting'`,
+rejects pending control / interrupt promises, schedules `proc.stdin.end()`
+plus a SIGKILL after 3 s, and returns. The entry stays in the registry
+with `state: 'exiting'` until the child process actually exits. A
+consumer that calls `destroy()` and immediately calls `listInstances()`
+will still see the entry. This is the correct behaviour: `destroy()` is
+"I don't want this anymore", not "do work" — the registry only forgets
+the entry when the OS-level process is gone (or when an error handler
+declares it dead).
 
 Meta is a single opaque slot per entry, not per-wrapper state.
 `setMeta(value)` overwrites; `getMeta<T>()` is an unchecked cast. The
@@ -246,37 +279,124 @@ registry observes lifecycle; it does not decide anything. No role
 management, no dispatch, no "send to the idle one" — that stays on the
 caller's side of the boundary.
 
-Lifecycle events ride on the same code paths but emit from four
+Lifecycle events ride on the same code paths but emit from five
 distinct sites. A module-level `EventEmitter<InstanceEventMap>`
 (`instanceEvents`) exposes `instance:added`, `instance:removed`,
-`instance:ready`, and `instance:meta-changed`. All emissions are
-synchronous; late subscribers do not receive replayed history.
+`instance:ready`, `instance:meta-changed`, and `instance:state-changed`.
+All emissions are synchronous; late subscribers do not receive replayed
+history.
+
+The instance state machine is the single source of truth for "what
+phase is this wrapper in?". `InstanceInfo.state` carries one of four
+values:
+
+- `spawning` — entry is registered, child process is alive, but the
+  wrapper has not yet completed its handshake. Initial state on
+  `register`.
+- `ready` — wrapper is idle and accepts `sendMessage`.
+- `busy` — a turn is in flight.
+- `exiting` — terminal. The wrapper is tearing down; no further
+  transitions are possible.
+
+Legal transitions: `spawning → {ready, exiting}`,
+`ready → {busy, exiting}`, `busy → {ready, exiting}`. Any other
+transition throws — defensive wiring; a silent ignore would re-introduce
+the drift the state machine eliminates. Same-state self-transitions and
+unknown ids are silent no-ops.
+
+Wrappers do **not** keep a local state mirror. The registry is the
+single source of truth; `inst.state` is a getter that calls
+`getState(id)` on every read. State mutations go through
+`transitionState(id, next)` directly. Claude transitions to `ready` via
+a `setImmediate(...)` callback scheduled at the end of the constructor;
+Codex after the `thread/start` / `thread/resume` handshake resolves.
+Both transition to `busy` on `sendMessage`'s write/turn-start success
+and back to `ready` on the result/`turn/completed` terminator. The
+`exiting` transition is performed by `destroy()`, by `proc.on('exit')`,
+by `proc.on('error')` / `stdin.on('error')`, and by Codex's
+`initialize()` catch — whichever path fires first.
+`interrupt()` does not change state — the wrapper stays in `busy`
+throughout the cancel.
+
+The per-instance `'error'` event is gated by a listener-count check:
+`safeEmitError(err)` only emits if at least one listener is attached.
+This prevents the default Node `EventEmitter` behaviour of throwing
+on unhandled `'error'` from crashing the host process when callers
+choose not to subscribe. Spawn-phase failures (during `state ===
+'spawning'`) **never** emit `'error'` regardless of listeners — they
+surface via `inst.ready` rejection only. This split keeps the two
+channels orthogonal: pre-ready failures are handled via `await
+inst.ready`'s rejection; post-ready failures (parser errors, child
+crashes mid-turn, stdin pipe failures) flow through the `'error'`
+event.
+
+**Late terminator contract.** A turn-result message can arrive *after*
+the wrapper has been torn down — `destroy()` was called mid-turn, the
+child crashed, or an error handler self-unregistered, but the result
+was already in flight on the stdout buffer when the teardown happened.
+Both wrappers guard the result/`turn/completed` branch with
+`getState(id) !== 'busy' → return` at the top. This drops the
+late terminator silently: no illegal `exiting → ready` transition
+throw, no `conversation` / `message` event on a torn-down instance, no
+phantom assistant turn appended to the in-memory transcript. The
+`busy` check covers both an entry that is still in the registry with
+state `'exiting'` *and* an entry that has already been unregistered
+(unknown id falls back to `'exiting'` via `getState`).
+
+**Spawning-phase error paths kill the child uniformly.** Both Claude
+error handlers (`stdin.on('error')`, `proc.on('error')`) call
+`this.destroy()` after rejecting `ready` (in the spawning branch) or
+emitting `'error'` (post-ready), so the child always gets a
+`stdin.end()` plus a scheduled SIGKILL — no orphan processes when the
+spawn-phase rejection is the only signal. Codex follows the same
+pattern via `tearDownChild` + `destroy()`. The explicit `rejectReady(err)`
+runs before `destroy()` so the consumer-visible rejection carries the
+real error; `destroy()`'s internal `rejectReady('Destroyed')` is a no-op
+on the already-settled promise.
+
+Failure ordering invariant: `instance:state-changed → exiting` always
+fires before `instance:removed`. Subscribers see the full lifecycle even
+on ENOENT or handshake failure. The `instance:removed` payload
+therefore always carries `state === 'exiting'`. `InstanceInfo.exitCode`
+is set on the snapshot when the deregistration runs from
+`proc.on('exit')`; on the spawn-failure paths (`proc.on('error')`,
+`stdin.on('error')`, Codex handshake failure) it is `null` because no
+real exit code exists.
 
 `instance:added` fires inside `register` after the entry is in the map.
 `instance:removed` fires inside `unregister` after the entry is deleted —
 the `InstanceInfo` snapshot is built *before* the `Map.delete` call, so
-subscribers receive the final session id, pid, and meta even though the
-live wrapper is no longer reachable through `getInstance`. Both fire only
-when the underlying mutation actually happened: a re-register of an
-existing id is a no-op (no second `instance:added`), and an `unregister`
-for an unknown id is a no-op (no orphan `instance:removed`). Because the
-wrapper registers before any async failure path can fire, an ENOENT or
-Codex handshake failure produces `instance:added` followed shortly by
-`instance:removed`.
+subscribers receive the final session id, pid, exitCode, and meta even
+though the live wrapper is no longer reachable through `getInstance`.
+Both fire only when the underlying mutation actually happened: a
+re-register of an existing id is a no-op, and an `unregister` for an
+unknown id is a no-op. The timing of `instance:removed` follows actual
+process death: a `destroy()` call transitions the entry to `'exiting'`
+but the `instance:removed` event waits for `proc.on('exit')` to fire (or
+for a defensive `unregister` from an error handler / Codex handshake
+catch).
 
-`instance:ready` fires from a `registry.emitReady(id)` helper invoked by
-each wrapper immediately after its internal `ready` flag flips to `true`.
-For Claude this happens inside the constructor, after `instance:added`,
-so the `added → ready` order is observable on the same tick that
-`createAIConversation()` returns; `info.sessionId` is still `null`
-because `system/init` only arrives after the first user message. For
-Codex this happens later, after the `thread/start` / `thread/resume`
-handshake resolves, so subscribers see `instance:added` first and
-`instance:ready` only after the handshake completes — by which point
-`info.sessionId` already carries the captured `threadId`. The flag is
-set exactly once per instance lifetime; the event therefore fires at
-most once per id. A handshake failure produces `instance:added` →
+`instance:ready` is emitted from inside `registry.transitionState(id,
+next)`, but only when `prev === 'spawning' && next === 'ready'`.
+Subsequent `busy → ready` transitions emit `instance:state-changed`
+without re-emitting `instance:ready`. For Claude the
+`spawning → ready` transition happens inside the constructor, after
+`instance:added`, so the `added → ready` order is observable on the
+same tick that `createAIConversation()` returns; `info.sessionId` is
+still `null` because `system/init` only arrives after the first user
+message. For Codex it happens later, after the `thread/start` /
+`thread/resume` handshake resolves, so subscribers see
+`instance:added` first and `instance:ready` only after the handshake
+completes — by which point `info.sessionId` already carries the
+captured `threadId`. The transition is exclusive; the event therefore
+fires at most once per id. A handshake failure produces
+`instance:added` → `instance:state-changed (spawning → exiting)` →
 `instance:removed` with no intervening `instance:ready`.
+
+`instance:state-changed` fires from `registry.transitionState` on every
+legal state change, with payload `[info, prev, next]`. `info.state ===
+next` is intentionally redundant. It is the consumer-visible event; the
+mutator (`transitionState`) is internal.
 
 `instance:meta-changed` fires inside `setMetaFor` after the meta slot is
 overwritten, with payload `[info, prev]` — `info.meta` carries the new
@@ -288,11 +408,35 @@ if the caller hands in the exact same reference twice (filtering is the
 consumer's concern, since `unknown` has no meaningful equality).
 
 Listeners must not throw. Node's `EventEmitter` propagates synchronous
-throws back to the emit site, which on `instance:ready` sits inside the
-Claude constructor or the Codex async handshake, and on
+throws back to the emit site, which on `instance:ready` /
+`instance:state-changed` sits inside the wrapper constructor /
+handshake / `sendMessage` / `result`-handler / `destroy` path, and on
 `instance:meta-changed` sits inside `setMeta`. Consumers compose
 `listInstances()` with `instanceEvents.on('instance:added', …)` for full
 coverage of pre-existing plus new instances.
+
+### Per-instance event surface
+
+`AIConversationInstance` extends `EventEmitter<InstanceMessageEventMap>`
+with three events:
+
+- `message: (text: string)` — assistant final text, fired after
+  `'conversation'` for the assistant turn.
+- `conversation: (turn: ConversationTurn)` — both user and assistant
+  turns. The user turn fires inside `sendMessage`'s write callback
+  before the promise resolves; the assistant turn fires when the
+  provider terminator arrives.
+- `error: (err: Error)` — parser errors, child crashes mid-turn, stdin
+  pipe failures. Gated by a listener-count check (`safeEmitError`):
+  emitting without a listener is a silent no-op, not a process crash.
+  Spawn-phase failures (state `'spawning'`) never emit here regardless
+  of listeners — they surface via `inst.ready` rejection.
+
+`sendMessage` rejections are NOT also fired on `'error'`. The promise
+rejection is the canonical channel for `sendMessage` failures
+(`'Destroyed'` / `'Already processing'` / `'Not ready'`, plus underlying
+stdin / JSON-RPC errors). The `'error'` event covers failures that have
+no callsite to reject.
 
 ### Interrupt protocol
 
@@ -340,18 +484,17 @@ can race the cancel:
 
 1. *Real interrupt* (Claude `is_error=true` + `subtype="error_during_execution"`,
    Codex `status="interrupted"`): no assistant turn appended, no
-   `onError`, `interrupt()` resolves. The dangling user turn from the
-   cancelled exchange stays.
+   `'error'` event, `interrupt()` resolves. The dangling user turn from
+   the cancelled exchange stays.
 2. *Natural completion* (Claude `is_error=false`, Codex `status="completed"`):
    the turn finished before the cancel landed. The assistant turn IS
-   appended and the normal `onConversation` / `onMessage` callbacks
-   fire, because `getTranscript()` is in-memory only and silently
-   dropping a successfully produced answer would erase it permanently.
+   appended and the normal `'conversation'` / `'message'` events fire,
+   because `getTranscript()` is in-memory only and silently dropping a
+   successfully produced answer would erase it permanently.
    `interrupt()` still resolves.
 3. *Real provider failure* during the cancel race (any other error
-   subtype / `status="failed"`): `onError` fires AND `interrupt()`
-   rejects with the same error. Masking a real failure as a successful
-   cancel would hide a real bug.
+   subtype / `status="failed"`): the `'error'` event fires AND
+   `interrupt()` rejects with the same error.
 
 **Persisted-history caveat.** Whether Claude's
 `error_during_execution` result lands in
