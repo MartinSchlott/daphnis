@@ -43,6 +43,22 @@ export interface OneShotOptions {
    * helper kills the child (SIGTERM) and rejects with an `AbortError`.
    */
   signal?: AbortSignal;
+  /**
+   * Permit unsandboxed execution. When `true`, Daphnis appends the provider's
+   * full-access bypass flag — Claude: `--dangerously-skip-permissions`,
+   * Codex: `--dangerously-bypass-approvals-and-sandbox`. When `false`
+   * (default), no sandbox/permission flag is added; caller env and CLI
+   * config decide.
+   */
+  fullAccess?: boolean;
+  /**
+   * Extra CLI arguments appended verbatim after Daphnis-managed args. No
+   * validation. Provider-specific flags (e.g. `--permission-mode` for
+   * Claude, `--sandbox` for Codex) are caller's responsibility. For Codex,
+   * `extraArgs` lands in the global flag position, before the `exec`
+   * subcommand.
+   */
+  extraArgs?: string[];
 }
 
 export interface OneShotResult<T = unknown> {
@@ -79,8 +95,10 @@ async function runClaudeOneShot<T>(opts: OneShotOptions): Promise<OneShotResult<
   const args: string[] = [
     '-p', opts.prompt,
     '--output-format', 'json',
-    '--dangerously-skip-permissions',
   ];
+  if (opts.fullAccess === true) {
+    args.push('--dangerously-skip-permissions');
+  }
   if (opts.systemPrompt !== undefined) {
     args.push('--system-prompt', opts.systemPrompt);
   }
@@ -93,6 +111,9 @@ async function runClaudeOneShot<T>(opts: OneShotOptions): Promise<OneShotResult<
   }
   if (opts.outputSchema !== undefined) {
     args.push('--json-schema', JSON.stringify(opts.outputSchema));
+  }
+  if (opts.extraArgs !== undefined && opts.extraArgs.length > 0) {
+    args.push(...opts.extraArgs);
   }
 
   const { stdout, exitCode } = await spawnAndCollect({
@@ -135,12 +156,18 @@ async function runCodexOneShot<T>(opts: OneShotOptions): Promise<OneShotResult<T
 
   try {
     const globalFlags: string[] = [];
+    if (opts.fullAccess === true) {
+      globalFlags.push('--dangerously-bypass-approvals-and-sandbox');
+    }
     if (opts.effort !== undefined) {
       const value = effortToCodexValue(opts.effort);
       if (value !== null) globalFlags.push('-c', `model_reasoning_effort=${value}`);
     }
     if (opts.model !== undefined) {
       globalFlags.push('-m', opts.model);
+    }
+    if (opts.extraArgs !== undefined && opts.extraArgs.length > 0) {
+      globalFlags.push(...opts.extraArgs);
     }
 
     const execArgs: string[] = ['--output-last-message', outputFile];

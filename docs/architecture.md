@@ -59,8 +59,9 @@ are implementation detail.
 ```
 spawn claude --print --input-format stream-json
              --output-format stream-json --verbose
-             --dangerously-skip-permissions [--resume <id>]
-             [--system-prompt ...] [--effort ...] [--model ...]
+             [--dangerously-skip-permissions if fullAccess]
+             [--resume <id>] [--system-prompt ...]
+             [--effort ...] [--model ...] [...extraArgs]
   ↓ stdin: JSON line per user message
   ↑ stdout: NDJSON stream
       type=system/init  → capture session_id
@@ -74,6 +75,11 @@ after the first user message, so we cannot wait for it.
 
 ```
 spawn codex [global flags] app-server
+
+  global flags = [--dangerously-bypass-approvals-and-sandbox if fullAccess]
+                 [-c model_reasoning_effort=...] [-m <model>]
+                 [...extraArgs]
+
   ↓↑ JSON-RPC 2.0 over stdio
       initialize → thread/start or thread/resume → ready
       turn/start → item/agentMessage/delta (buffer) → turn/completed
@@ -87,7 +93,9 @@ Codex requires an initialisation handshake. Ready only fires after
 
 ```
 spawn claude -p <prompt> --output-format json
-             --dangerously-skip-permissions [flags]
+             [--dangerously-skip-permissions if fullAccess]
+             [--system-prompt ...] [--effort ...] [--model ...]
+             [--json-schema ...] [...extraArgs]
   stdio: ['ignore', 'pipe', 'pipe']
   resolve on 'close' (not 'exit') → stdout is a single JSON envelope
 ```
@@ -97,6 +105,11 @@ spawn claude -p <prompt> --output-format json
 ```
 spawn codex [global flags] exec --output-last-message <tmpfile>
             [--output-schema <tmpfile>] <prompt>
+
+  global flags = [--dangerously-bypass-approvals-and-sandbox if fullAccess]
+                 [-c model_reasoning_effort=...] [-m <model>]
+                 [...extraArgs]
+
   assistant text is read from the tmpfile after 'close'
   tmp directory cleaned up in finally
 ```
@@ -154,6 +167,46 @@ supported gear per provider. `'default'` returns `null` and the flag is
 omitted — the CLI uses its own default. `min` and `max` are silent
 aliases: Codex `min → minimal`, `max → xhigh`; Claude `min → low`. No
 validation of the `model` string — it is passed through as-is.
+
+### Sandbox policy and pass-through args
+
+Two knobs cover the sandbox / permissions surface uniformly across
+providers:
+
+- `fullAccess: boolean` (default `false`) — when `true`, Daphnis appends
+  the provider's full-access bypass flag
+  (`--dangerously-skip-permissions` for Claude,
+  `--dangerously-bypass-approvals-and-sandbox` for Codex). When `false`,
+  no sandbox/permission CLI flag is added; the CLI's own config decides.
+- `extraArgs: string[]` — appended verbatim after Daphnis-managed args.
+  No validation, no provider awareness. For Codex the list lands in the
+  global flag block, *before* the `app-server` / `exec` subcommand —
+  flags like `--sandbox`, `--ask-for-approval`, and `-c key=value` are
+  not subcommand flags and would be rejected if placed after.
+  Subcommand-specific flags are out of scope. For Claude the list is
+  appended at the end of the spawn args; there is no subcommand split.
+
+A boolean rather than an enum, because the Codex sandbox enum
+(`read-only` / `workspace-write` / `danger-full-access`) has no
+non-interactive Claude equivalent. A typed union that covered only one
+provider would lie about behaviour. Callers who want a middle ground
+combine `fullAccess: false` with the appropriate `extraArgs` recipe
+(e.g. `['--sandbox', 'read-only']` for Codex,
+`['--permission-mode', 'plan']` for Claude).
+
+The pass-through-without-validation pattern matches `model` and `env`:
+Daphnis treats these as opaque strings the CLI knows how to interpret.
+A caller mixing `fullAccess: true` with a contradicting `extraArgs`
+flag (e.g. `['--sandbox', 'read-only']`) sees both flags reach the CLI;
+resolution is the CLI's job.
+
+**Scope:** `fullAccess` toggles the CLI flag only. It does **not**
+change Daphnis' JSON-RPC auto-approval layer in
+`CodexCLIWrapper.handleServerRequest` (auto-`accept` for command/file
+requests, fixed read/write/network/macOS grants for the permissions
+request). That layer is required for the `app-server` handshake to
+make progress without a human in the loop and is independent of this
+option.
 
 ### Instance registry
 
@@ -215,6 +268,14 @@ on the session's `cwd`, enables network, and grants macOS sub-permissions
 — matching what an interactive `codex` session would elicit from the
 user. Unknown server-initiated methods return a JSON-RPC `-32601` error
 (fail-closed).
+
+`fullAccess: true` short-circuits both the OS-level Codex sandbox **and**
+the JSON-RPC approval round-trip — Codex emits no approval requests
+once the bypass flag is active, so the auto-approval layer simply does
+not run. With `fullAccess: false` (default), the auto-approval policy
+above stays in place unchanged; the CLI's own sandbox (or an
+`extraArgs`-supplied `--sandbox …`) is what actually gates risky ops in
+that mode. The auto-approver is a handshake helper, not a sandbox.
 
 ## Test strategy
 

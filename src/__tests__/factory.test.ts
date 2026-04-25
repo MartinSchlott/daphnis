@@ -117,4 +117,33 @@ describe('createAIConversation', () => {
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toEqual(['-c', 'model_reasoning_effort=xhigh', '-m', 'codex-x', 'app-server']);
   });
+
+  it('forwards fullAccess and extraArgs to the claude wrapper', () => {
+    mockSpawn.mockClear();
+    mockSpawn.mockReturnValue(createFakeProcess());
+    createAIConversation({
+      provider: 'claude', cwd: '/tmp',
+      fullAccess: true, extraArgs: ['--permission-mode', 'plan'],
+    });
+
+    const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+    expect(spawnArgs).toContain('--dangerously-skip-permissions');
+    expect(spawnArgs.slice(-2)).toEqual(['--permission-mode', 'plan']);
+  });
+
+  it('forwards fullAccess and extraArgs to the codex wrapper', () => {
+    mockSpawn.mockClear();
+    mockSpawn.mockReturnValue(createFakeProcess());
+    createAIConversation({
+      provider: 'codex', cwd: '/tmp',
+      fullAccess: true, extraArgs: ['--sandbox', 'read-only'],
+    });
+
+    const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+    expect(spawnArgs).toEqual([
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--sandbox', 'read-only',
+      'app-server',
+    ]);
+  });
 });

@@ -11,11 +11,13 @@ export function createAIConversation(options: AIConversationOptions): AIConversa
       return new ClaudeCLIWrapper(
         binary, options.cwd, id, options.handlers, options.systemPrompt,
         options.sessionId, options.effort, options.model, options.env,
+        options.fullAccess, options.extraArgs,
       );
     case 'codex':
       return new CodexCLIWrapper(
-        binary, options.cwd, id, options.handlers, options.systemPrompt, options.clientInfo,
+        binary, options.cwd, id, options.handlers, options.systemPrompt,
         options.sessionId, options.effort, options.model, options.env,
+        options.fullAccess, options.extraArgs,
       );
     default:
       throw new Error(`Unknown provider: ${options.provider}`);

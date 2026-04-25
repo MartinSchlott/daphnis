@@ -166,6 +166,45 @@ describe('runOneShotPrompt — claude', () => {
     expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
+  it('default omits --dangerously-skip-permissions', async () => {
+    const proc = createFakeProcess();
+    mockSpawn.mockReturnValue(proc);
+    emitEnvelope(proc, { result: 'ok', session_id: 's' });
+
+    await runOneShotPrompt({ provider: 'claude', cwd: '/tmp', prompt: 'hi' });
+
+    const args = mockSpawn.mock.calls[0]![1] as string[];
+    expect(args).not.toContain('--dangerously-skip-permissions');
+  });
+
+  it('fullAccess: true appends --dangerously-skip-permissions', async () => {
+    const proc = createFakeProcess();
+    mockSpawn.mockReturnValue(proc);
+    emitEnvelope(proc, { result: 'ok', session_id: 's' });
+
+    await runOneShotPrompt({
+      provider: 'claude', cwd: '/tmp', prompt: 'hi',
+      fullAccess: true,
+    });
+
+    const args = mockSpawn.mock.calls[0]![1] as string[];
+    expect(args).toContain('--dangerously-skip-permissions');
+  });
+
+  it('extraArgs are appended at the end of args', async () => {
+    const proc = createFakeProcess();
+    mockSpawn.mockReturnValue(proc);
+    emitEnvelope(proc, { result: 'ok', session_id: 's' });
+
+    await runOneShotPrompt({
+      provider: 'claude', cwd: '/tmp', prompt: 'hi',
+      extraArgs: ['--permission-mode', 'auto'],
+    });
+
+    const args = mockSpawn.mock.calls[0]![1] as string[];
+    expect(args.slice(-2)).toEqual(['--permission-mode', 'auto']);
+  });
+
   it('rejects with AbortError when signal aborts', async () => {
     const proc = createFakeProcess();
     mockSpawn.mockReturnValue(proc);
@@ -245,6 +284,63 @@ describe('runOneShotPrompt — codex', () => {
 
     const args = mockSpawn.mock.calls[0]![1] as string[];
     expect(args[args.length - 1]).toBe('sys-part\n\nuser-part');
+  });
+
+  it('default omits --dangerously-bypass-approvals-and-sandbox', async () => {
+    const proc = createFakeProcess();
+    mockSpawn.mockReturnValue(proc);
+    readFileSpy.mockResolvedValueOnce('out');
+    setImmediate(() => {
+      proc.stdout.end();
+      proc.stderr.end();
+      setImmediate(() => proc.emit('close', 0));
+    });
+
+    await runOneShotPrompt({ provider: 'codex', cwd: '/tmp', prompt: 'hi' });
+
+    const args = mockSpawn.mock.calls[0]![1] as string[];
+    expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+  });
+
+  it('fullAccess: true places bypass flag in the global block, before exec', async () => {
+    const proc = createFakeProcess();
+    mockSpawn.mockReturnValue(proc);
+    readFileSpy.mockResolvedValueOnce('out');
+    setImmediate(() => {
+      proc.stdout.end();
+      proc.stderr.end();
+      setImmediate(() => proc.emit('close', 0));
+    });
+
+    await runOneShotPrompt({
+      provider: 'codex', cwd: '/tmp', prompt: 'hi',
+      fullAccess: true,
+    });
+
+    const args = mockSpawn.mock.calls[0]![1] as string[];
+    const bypassIdx = args.indexOf('--dangerously-bypass-approvals-and-sandbox');
+    const execIdx = args.indexOf('exec');
+    expect(bypassIdx).toBeGreaterThanOrEqual(0);
+    expect(execIdx).toBeGreaterThan(bypassIdx);
+  });
+
+  it('extraArgs land in the global block, before exec', async () => {
+    const proc = createFakeProcess();
+    mockSpawn.mockReturnValue(proc);
+    readFileSpy.mockResolvedValueOnce('out');
+    setImmediate(() => {
+      proc.stdout.end();
+      proc.stderr.end();
+      setImmediate(() => proc.emit('close', 0));
+    });
+
+    await runOneShotPrompt({
+      provider: 'codex', cwd: '/tmp', prompt: 'hi',
+      extraArgs: ['--sandbox', 'read-only'],
+    });
+
+    const args = mockSpawn.mock.calls[0]![1] as string[];
+    expect(args.slice(0, 3)).toEqual(['--sandbox', 'read-only', 'exec']);
   });
 
   it('cleans up tmp dir even when codex exits non-zero', async () => {

@@ -55,8 +55,6 @@ export interface AIConversationOptions {
   binary?: string;
   /** System prompt / developer instructions passed to the AI agent. */
   systemPrompt?: string;
-  /** Client identity for the Codex JSON-RPC handshake. Ignored for Claude. */
-  clientInfo?: { name: string; title?: string; version: string };
   /** Session ID from a previous conversation. When provided, the CLI resumes that session. */
   sessionId?: string;
   /** Reasoning effort. Defaults to `'default'` (no flag passed; CLI decides). */
@@ -65,4 +63,22 @@ export interface AIConversationOptions {
   model?: string;
   /** Extra env vars merged into the child process env at spawn. */
   env?: Record<string, string>;
+  /**
+   * Permit unsandboxed execution. When `true`, Daphnis appends the provider's
+   * full-access bypass flag — Claude: `--dangerously-skip-permissions`,
+   * Codex: `--dangerously-bypass-approvals-and-sandbox`. When `false`
+   * (default), no sandbox/permission flag is added; caller env and CLI
+   * config decide. Note: Claude in non-interactive stream-json mode will
+   * block on tool calls without a permission flag — set `fullAccess: true`
+   * or supply `--permission-mode` via `extraArgs`.
+   */
+  fullAccess?: boolean;
+  /**
+   * Extra CLI arguments appended verbatim after Daphnis-managed args. No
+   * validation. Provider-specific flags (e.g. `--permission-mode` for
+   * Claude, `--sandbox` for Codex) are caller's responsibility. For Codex,
+   * `extraArgs` lands in the global flag position, before the `app-server`
+   * / `exec` subcommand.
+   */
+  extraArgs?: string[];
 }

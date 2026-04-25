@@ -105,7 +105,7 @@ describe('CodexCLIWrapper', () => {
     expect(wrapper.getSessionId()).toBe('thread-session-42');
   });
 
-  it('sends initialize with experimentalApi and configurable clientInfo', async () => {
+  it('sends initialize with experimentalApi and hardcoded daphnis clientInfo', async () => {
     const stdinChunks = captureStdin(fakeProc);
     new CodexCLIWrapper('codex', '/tmp', TEST_ID);
 
@@ -117,9 +117,7 @@ describe('CodexCLIWrapper', () => {
     expect(initMsg!['id']).toBe(1);
 
     const params = initMsg!['params'] as Record<string, unknown>;
-    // Default clientInfo
     expect(params['clientInfo']).toEqual({ name: 'daphnis', title: 'Daphnis', version: '1.0.0' });
-    // experimentalApi must be enabled
     expect(params['capabilities']).toEqual({ experimentalApi: true });
 
     // Respond to initialize
@@ -133,7 +131,7 @@ describe('CodexCLIWrapper', () => {
 
   it('sends thread/resume instead of thread/start when sessionId is provided', async () => {
     const stdinChunks = captureStdin(fakeProc);
-    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, 'prev-thread-99');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, 'prev-thread-99');
 
     await new Promise(resolve => setTimeout(resolve, 10));
 
@@ -168,17 +166,6 @@ describe('CodexCLIWrapper', () => {
 
     const resumeMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'thread/resume');
     expect(resumeMsg).toBeUndefined();
-  });
-
-  it('uses custom clientInfo when provided', async () => {
-    const stdinChunks = captureStdin(fakeProc);
-    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, { name: 'myapp', title: 'My App', version: '2.0.0' });
-
-    await new Promise(resolve => setTimeout(resolve, 10));
-
-    const initMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'initialize');
-    const params = initMsg!['params'] as Record<string, unknown>;
-    expect(params['clientInfo']).toEqual({ name: 'myapp', title: 'My App', version: '2.0.0' });
   });
 
   it('fires onError on init failure', async () => {
@@ -643,14 +630,14 @@ describe('CodexCLIWrapper', () => {
   // --- effort / model passthrough ---
 
   it('prepends -c model_reasoning_effort=xhigh when effort=max is passed (max → xhigh)', () => {
-    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, 'max');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, 'max');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toEqual(['-c', 'model_reasoning_effort=xhigh', 'app-server']);
   });
 
   it('prepends -c model_reasoning_effort=minimal when effort=min is passed', () => {
-    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, 'min');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, 'min');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toEqual(['-c', 'model_reasoning_effort=minimal', 'app-server']);
@@ -664,24 +651,71 @@ describe('CodexCLIWrapper', () => {
   });
 
   it('does not include -c model_reasoning_effort when effort=default', () => {
-    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, 'default');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, 'default');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs.find((a) => a.startsWith('model_reasoning_effort='))).toBeUndefined();
   });
 
   it('passes -m model before app-server', () => {
-    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, undefined, 'gpt-5.4');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, 'gpt-5.4');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toEqual(['-m', 'gpt-5.4', 'app-server']);
   });
 
   it('places all global flags before app-server when both effort and model are set', () => {
-    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, 'high', 'gpt-x');
+    new CodexCLIWrapper('codex', '/tmp', TEST_ID, undefined, undefined, undefined, 'high', 'gpt-x');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toEqual(['-c', 'model_reasoning_effort=high', '-m', 'gpt-x', 'app-server']);
+  });
+
+  describe('fullAccess and extraArgs', () => {
+    it('default does not include --dangerously-bypass-approvals-and-sandbox', () => {
+      new CodexCLIWrapper('codex', '/tmp', TEST_ID);
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+    });
+
+    it('fullAccess: true places bypass flag before app-server, exactly once', () => {
+      new CodexCLIWrapper(
+        'codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, undefined, undefined,
+        true,
+      );
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      const occurrences = spawnArgs.filter((a) => a === '--dangerously-bypass-approvals-and-sandbox').length;
+      expect(occurrences).toBe(1);
+      const bypassIdx = spawnArgs.indexOf('--dangerously-bypass-approvals-and-sandbox');
+      const appServerIdx = spawnArgs.indexOf('app-server');
+      expect(bypassIdx).toBeLessThan(appServerIdx);
+    });
+
+    it('extraArgs land in the global flag block, before app-server, in order', () => {
+      new CodexCLIWrapper(
+        'codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, undefined, undefined,
+        undefined, ['--sandbox', 'read-only'],
+      );
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs).toEqual(['--sandbox', 'read-only', 'app-server']);
+    });
+
+    it('fullAccess: true and extraArgs are both global, bypass first', () => {
+      new CodexCLIWrapper(
+        'codex', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, undefined, undefined,
+        true, ['--ask-for-approval', 'never'],
+      );
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs).toEqual([
+        '--dangerously-bypass-approvals-and-sandbox',
+        '--ask-for-approval', 'never',
+        'app-server',
+      ]);
+    });
   });
 
   describe('registry integration', () => {

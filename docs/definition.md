@@ -50,6 +50,12 @@ cannot be modelled without compromise is out of scope.
 - Uniform `ConversationTurn` shape (`role`, `content`, `timestamp`).
 - An environment-variable blacklist applied at spawn to prevent the parent
   Claude Code / VS Code state from leaking into the child process.
+- Uniform sandbox knob: `fullAccess: boolean` toggles the provider's
+  bypass flag (`--dangerously-skip-permissions` for Claude,
+  `--dangerously-bypass-approvals-and-sandbox` for Codex), and
+  `extraArgs: string[]` is a verbatim pass-through for everything we
+  deliberately do not abstract. Both apply uniformly to persistent
+  sessions and one-shot.
 
 ### Out of scope (deliberately)
 
@@ -69,8 +75,10 @@ cannot be modelled without compromise is out of scope.
   between machines or users. This is a consequence of using the CLIs as
   intended, not a bug.
 - **Provider-specific features that do not generalise.** If a feature only
-  works on one side, it stays out unless the asymmetry can be hidden
-  without lying about behaviour.
+  works on one side, it stays out of the abstracted options surface
+  unless the asymmetry can be hidden without lying about behaviour.
+  Provider-specific *CLI flags* are still expressible via `extraArgs` —
+  Daphnis just does not give them named option fields.
 
 ## Entities
 

@@ -42,7 +42,6 @@ export class CodexCLIWrapper implements AIConversationInstance {
   private pendingRequests = new Map<number, PendingRequest>();
   private turnBuffer = '';
   private readonly systemPrompt: string | null;
-  private readonly clientInfo: { name: string; title?: string; version: string };
   private readonly resumeSessionId: string | null;
   private historyLoadPromise: Promise<void> | null = null;
 
@@ -56,14 +55,14 @@ export class CodexCLIWrapper implements AIConversationInstance {
   constructor(
     binary: string, cwd: string, instanceId: string,
     handlers?: AIConversationHandlers,
-    systemPrompt?: string, clientInfo?: { name: string; title?: string; version: string },
+    systemPrompt?: string,
     sessionId?: string, effort?: Effort, model?: string,
     envExtra?: Record<string, string>,
+    fullAccess?: boolean, extraArgs?: string[],
   ) {
     this.cwd = cwd;
     this.instanceId = instanceId;
     this.systemPrompt = systemPrompt ?? null;
-    this.clientInfo = clientInfo ?? { name: 'daphnis', title: 'Daphnis', version: '1.0.0' };
     this.resumeSessionId = sessionId ?? null;
 
     // 1. Set no-op defaults
@@ -85,12 +84,18 @@ export class CodexCLIWrapper implements AIConversationInstance {
     // 3. Spawn process. Global flags (effort, model) precede the `app-server`
     // subcommand — codex does not accept them after.
     const globalFlags: string[] = [];
+    if (fullAccess === true) {
+      globalFlags.push('--dangerously-bypass-approvals-and-sandbox');
+    }
     if (effort !== undefined) {
       const value = effortToCodexValue(effort);
       if (value !== null) globalFlags.push('-c', `model_reasoning_effort=${value}`);
     }
     if (model !== undefined) {
       globalFlags.push('-m', model);
+    }
+    if (extraArgs !== undefined && extraArgs.length > 0) {
+      globalFlags.push(...extraArgs);
     }
 
     this.proc = spawn(binary, [...globalFlags, 'app-server'], {
@@ -147,7 +152,7 @@ export class CodexCLIWrapper implements AIConversationInstance {
     try {
       // Step 1: Send initialize
       await this.sendJsonRpcRequest('initialize', {
-        clientInfo: { name: this.clientInfo.name, title: this.clientInfo.title, version: this.clientInfo.version },
+        clientInfo: { name: 'daphnis', title: 'Daphnis', version: '1.0.0' },
         capabilities: { experimentalApi: true },
       });
 

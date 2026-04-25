@@ -49,6 +49,7 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
     handlers?: AIConversationHandlers,
     systemPrompt?: string, sessionId?: string, effort?: Effort, model?: string,
     envExtra?: Record<string, string>,
+    fullAccess?: boolean, extraArgs?: string[],
   ) {
     this.cwd = cwd;
     this.instanceId = instanceId;
@@ -84,8 +85,10 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--verbose',
-      '--dangerously-skip-permissions',
     ];
+    if (fullAccess === true) {
+      args.push('--dangerously-skip-permissions');
+    }
     if (sessionId) {
       args.push('--resume', sessionId);
     }
@@ -98,6 +101,9 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
     }
     if (model !== undefined) {
       args.push('--model', model);
+    }
+    if (extraArgs !== undefined && extraArgs.length > 0) {
+      args.push(...extraArgs);
     }
 
     this.proc = spawn(binary, args, {

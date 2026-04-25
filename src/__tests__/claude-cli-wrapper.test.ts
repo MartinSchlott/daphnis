@@ -256,7 +256,7 @@ describe('ClaudeCLIWrapper', () => {
 
     expect(mockSpawn).toHaveBeenCalledWith(
       'claude',
-      ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'],
+      ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'],
       expect.objectContaining({
         cwd: '/my/project',
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -294,7 +294,7 @@ describe('ClaudeCLIWrapper', () => {
 
     expect(mockSpawn).toHaveBeenCalledWith(
       'claude',
-      ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions', '--system-prompt', 'You are a helpful assistant'],
+      ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--system-prompt', 'You are a helpful assistant'],
       expect.any(Object),
     );
   });
@@ -440,6 +440,60 @@ describe('ClaudeCLIWrapper', () => {
     const result3 = await wrapper.getTranscript();
     expect(result3).toEqual(result1);
     expect(mockLoadSessionHistory).toHaveBeenCalledOnce();
+  });
+
+  describe('fullAccess and extraArgs', () => {
+    it('default (no fullAccess) does not include --dangerously-skip-permissions', () => {
+      new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs).not.toContain('--dangerously-skip-permissions');
+    });
+
+    it('fullAccess: true appends --dangerously-skip-permissions exactly once', () => {
+      new ClaudeCLIWrapper(
+        'claude', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, undefined, undefined,
+        true,
+      );
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      const occurrences = spawnArgs.filter((a) => a === '--dangerously-skip-permissions').length;
+      expect(occurrences).toBe(1);
+    });
+
+    it('fullAccess: false does not include --dangerously-skip-permissions', () => {
+      new ClaudeCLIWrapper(
+        'claude', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, undefined, undefined,
+        false,
+      );
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs).not.toContain('--dangerously-skip-permissions');
+    });
+
+    it('extraArgs are appended at the end of the spawn args, in order', () => {
+      new ClaudeCLIWrapper(
+        'claude', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, undefined, undefined,
+        undefined, ['--permission-mode', 'auto'],
+      );
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs.slice(-2)).toEqual(['--permission-mode', 'auto']);
+    });
+
+    it('fullAccess: true precedes extraArgs in the spawn args', () => {
+      new ClaudeCLIWrapper(
+        'claude', '/tmp', TEST_ID, undefined, undefined, undefined, undefined, undefined, undefined,
+        true, ['--permission-mode', 'plan'],
+      );
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      const bypassIdx = spawnArgs.indexOf('--dangerously-skip-permissions');
+      const modeIdx = spawnArgs.indexOf('--permission-mode');
+      expect(bypassIdx).toBeGreaterThanOrEqual(0);
+      expect(modeIdx).toBeGreaterThan(bypassIdx);
+      expect(spawnArgs[modeIdx + 1]).toBe('plan');
+    });
   });
 
   describe('registry integration', () => {
