@@ -1,6 +1,6 @@
 {
   "name": "@ai-inquisitor/daphnis",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Thin, provider-agnostic TypeScript wrapper for the Claude CLI and OpenAI Codex CLI.",
   "type": "module",
   "exports": {
@@ -10,7 +10,7 @@
     }
   },
   "files": ["dist"],
-  "engines": { "node": ">=18" },
+  "engines": { "node": ">=22" },
   "scripts": {
     "build": "tsc",
     "test": "vitest run",

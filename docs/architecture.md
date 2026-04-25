@@ -4,8 +4,10 @@
 
 - **Language**: TypeScript, `strict: true`, target ES2022.
 - **Module system**: ESM (`"type": "module"`, `moduleResolution: "Node16"`).
-- **Runtime**: Node.js ≥ 18 (uses `node:child_process`, `node:fs/promises`,
-  `node:os`, `node:crypto` — no native deps).
+- **Runtime**: Node.js ≥ 22 (uses `node:child_process`, `node:fs/promises`,
+  `node:os`, `node:crypto`, `node:events` — no native deps). The typed
+  generic `EventEmitter<T>` from `@types/node@^22` is used by the
+  instance registry.
 - **Build**: `tsc` → `dist/`, declaration + declaration maps + source maps.
 - **Tests**: `vitest`, mocked `node:child_process` + `node:fs/promises`.
 - **No runtime dependencies.** The only deps are `@types/node`,
@@ -44,7 +46,8 @@ Flat layout, single package. No monorepo, no workspaces.
   `AIConversationHandlers`, `ConversationTurn`, `Effort`
 - `runOneShotPrompt` + `OneShotOptions`, `OneShotResult`
 - `listSessions` + `SessionInfo`
-- `listInstances`, `getInstance` + `InstanceInfo`
+- `listInstances`, `getInstance`, `instanceEvents` + `InstanceInfo`,
+  `InstanceEventMap`
 
 Nothing else is exported. Internal helpers (NDJSON parser, effort mapping)
 are implementation detail.
@@ -185,6 +188,24 @@ Meta is a single opaque slot per entry, not per-wrapper state.
 registry observes lifecycle; it does not decide anything. No role
 management, no dispatch, no "send to the idle one" — that stays on the
 caller's side of the boundary.
+
+Lifecycle events ride on the same code paths. A module-level
+`EventEmitter<InstanceEventMap>` (`instanceEvents`) emits `instance:added`
+inside `register` after the entry is in the map, and `instance:removed`
+inside `unregister` after the entry is deleted. The `InstanceInfo`
+snapshot for `instance:removed` is built *before* the `Map.delete` call,
+so subscribers receive the final session id, pid, and meta even though
+the live wrapper is no longer reachable through `getInstance`. Emission
+fires only when the underlying mutation actually happened: a re-register
+of an existing id is a no-op (no second `instance:added`), and an
+`unregister` for an unknown id is a no-op (no orphan `instance:removed`).
+Dispatch is synchronous — `instance:added` fires before
+`createAIConversation()` returns, and an ENOENT or Codex handshake
+failure produces `instance:added` followed shortly by `instance:removed`
+because the wrapper registers before any async failure path can fire.
+Late subscribers do not receive replayed history; consumers compose
+`listInstances()` with `instanceEvents.on('instance:added', …)` for full
+coverage.
 
 ### Codex permission handshake
 

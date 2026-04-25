@@ -35,6 +35,22 @@ Same code works with `provider: 'codex'`. No branches in your caller.
 
 **Instance registry.** Every instance produced by `createAIConversation` is auto-registered under a daphnis-assigned UUID. `listInstances()` returns a fresh DTO array; `getInstance(id)` returns the live reference. Each instance exposes `getInstanceId()` and a single opaque meta slot (`setMeta(value)` / `getMeta<T>()`) so callers can hang a project name, label, or whatever on an instance without keeping a parallel map. Deregistration is automatic: synchronous on `destroy()`, and before `onExit` fires on a child exit. The registry is passive — enumeration and metadata only, no orchestration.
 
+**Lifecycle events.** `instanceEvents` is a typed `EventEmitter<InstanceEventMap>` exposing `instance:added` and `instance:removed`. Subscribe once and react to lifecycle without polling `listInstances()`.
+
+```typescript
+import { instanceEvents, createAIConversation } from '@ai-inquisitor/daphnis'
+
+instanceEvents.on('instance:added',   info => console.log('added',   info.id, info.cwd))
+instanceEvents.on('instance:removed', info => console.log('removed', info.id))
+
+const a = createAIConversation({ provider: 'claude', cwd: process.cwd() })
+// → 'added <uuid> <cwd>'
+a.destroy()
+// → 'removed <uuid>'
+```
+
+Events are forward-only — no replay for late subscribers. Compose `listInstances()` with `instanceEvents.on('instance:added', …)` for full coverage of pre-existing plus new instances.
+
 ## Quick taste
 
 ```typescript
@@ -145,7 +161,7 @@ const agent = createAIConversation({
 
 ## LLM Reference
 
-Daphnis: thin TypeScript wrapper around the official Claude CLI and OpenAI Codex CLI. Two execution modes (persistent conversation, one-shot), five public functions (`createAIConversation`, `runOneShotPrompt`, `listSessions`, `listInstances`, `getInstance`), one uniform provider switch (`'claude' | 'codex'`). Uses the CLIs exactly as their vendors intended — this is what makes it TOS-conform: it's a wrapper, not a proxy or re-implementation.
+Daphnis: thin TypeScript wrapper around the official Claude CLI and OpenAI Codex CLI. Two execution modes (persistent conversation, one-shot), five public functions (`createAIConversation`, `runOneShotPrompt`, `listSessions`, `listInstances`, `getInstance`) plus one public `EventEmitter` (`instanceEvents`), one uniform provider switch (`'claude' | 'codex'`). Uses the CLIs exactly as their vendors intended — this is what makes it TOS-conform: it's a wrapper, not a proxy or re-implementation.
 
 **Architecture — why two modes:** Persistent and one-shot have different process models. Persistent = long-lived child with open stdio where messages flow both ways; Codex adds a JSON-RPC handshake and Claude adds NDJSON stream-json framing. One-shot = spawn with `stdin: 'ignore'`, collect stdout, parse, exit. The modes share the env filter, effort mapping, and NDJSON parser — nothing else. They do not try to present a common "session" that isn't really there.
 
@@ -163,9 +179,9 @@ Daphnis: thin TypeScript wrapper around the official Claude CLI and OpenAI Codex
 
 **Session storage:** Claude writes `~/.claude/projects/<cwd-slash-to-dash>/<session-uuid>.jsonl` — the cwd is encoded by replacing `/` and whitespace with `-`. Codex writes `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl` with the cwd embedded in a `session_meta` payload. `listSessions` reads those paths directly. Consequence: sessions are bound to `(host user, cwd)` and are not portable between machines or users. Moving `.claude/projects` between hosts will not preserve session continuity — that's a consequence of using the CLIs as intended, not a daphnis limitation.
 
-**Public API surface — `src/index.ts` re-exports exactly:** `createAIConversation`, `AIConversationInstance`, `AIConversationOptions`, `AIConversationHandlers`, `ConversationTurn`, `Effort`, `runOneShotPrompt`, `OneShotOptions`, `OneShotResult`, `listSessions`, `SessionInfo`, `listInstances`, `getInstance`, `InstanceInfo`. Nothing else. Internal helpers (`NdjsonParser`, effort mapping, `loadSessionHistory`, internal registry `register` / `unregister` / `setMetaFor` / `getMetaFor`) are implementation detail and not exposed.
+**Public API surface — `src/index.ts` re-exports exactly:** `createAIConversation`, `AIConversationInstance`, `AIConversationOptions`, `AIConversationHandlers`, `ConversationTurn`, `Effort`, `runOneShotPrompt`, `OneShotOptions`, `OneShotResult`, `listSessions`, `SessionInfo`, `listInstances`, `getInstance`, `instanceEvents`, `InstanceInfo`, `InstanceEventMap`. Nothing else. Internal helpers (`NdjsonParser`, effort mapping, `loadSessionHistory`, internal registry `register` / `unregister` / `setMetaFor` / `getMetaFor`) are implementation detail and not exposed.
 
-**Runtime dependencies:** zero. `@types/node`, `typescript`, `vitest` are devDependencies only. Node ≥ 18, ESM, `moduleResolution: "Node16"`.
+**Runtime dependencies:** zero. `@types/node`, `typescript`, `vitest` are devDependencies only. Node ≥ 22, ESM, `moduleResolution: "Node16"`. The Node 22 floor exists so the typed generic `EventEmitter<InstanceEventMap>` from `@types/node@^22` resolves without subclassing or casts.
 
 **Invariants — things that will bite you if you assume otherwise:**
 Credentials are never read, prompted, or stored by daphnis. The caller passes `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `OPENAI_API_KEY` (or whatever) via `options.env`. If you forget this, the child CLI falls back to whatever the host user is logged into — usually not what you want in a programmatic context.
@@ -179,3 +195,4 @@ No retry, no rate-limit handling, no backoff. If the CLI exits non-zero or error
 Codex permission scope is the session cwd, exactly. `fileSystem.read`/`write` arrays contain only the cwd string. If the CLI tries to touch files outside cwd, the request will be denied. Pass a broader cwd at spawn, or fork the permission handler.
 Persistent sessions survive process death only through the on-disk `.jsonl` file. If you kill the daphnis process and start a new one, pass the `sessionId` to the new `createAIConversation` to pick up where you left off. There is no in-memory handover — the CLI re-reads its own transcript from disk on `--resume` / `thread/resume`.
 Registry deregistration runs *before* `onExit` fires, and `listInstances()` DTOs carry whatever `getSessionId()` returns *at call time* — which is `null` on Claude until the first reply arrives. A caller iterating `listInstances()` for Claude entries right after construction must tolerate `sessionId: null`, same as reading `getSessionId()` directly.
+Lifecycle events fire synchronously inside `register` / `unregister`. `instance:added` fires before `createAIConversation()` returns. For `instance:removed`, the entry is deleted from the map *before* the event is emitted — a subscriber that calls `listInstances()` from inside the handler sees the instance already gone, but the event payload carries the final `InstanceInfo` snapshot (id, sessionId, pid, meta) captured before the delete. Events are forward-only: late subscribers do not receive replayed history. Spawn-failure semantics — the wrapper registers before any async failure can fire, so an ENOENT or Codex handshake failure produces `instance:added` followed shortly by `instance:removed`. The standard `EventEmitter` listener-leak warning fires past 10 listeners; raise the cap with `instanceEvents.setMaxListeners(n)` if you actually need that many.

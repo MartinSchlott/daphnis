@@ -15,7 +15,7 @@ vi.mock('../sessions.js', () => ({
 }));
 
 const { ClaudeCLIWrapper } = await import('../claude-cli-wrapper.js');
-const { __resetForTests, listInstances, getInstance } = await import('../registry.js');
+const { __resetForTests, listInstances, getInstance, instanceEvents } = await import('../registry.js');
 const { createAIConversation } = await import('../factory.js');
 
 const TEST_ID = 'test-id';
@@ -506,6 +506,64 @@ describe('ClaudeCLIWrapper', () => {
 
       expect(lengthAtExit).toBe(0);
       expect(listInstances()).toHaveLength(0);
+    });
+  });
+
+  describe('lifecycle events', () => {
+    it('construction emits instance:added exactly once', () => {
+      const added = vi.fn();
+      instanceEvents.on('instance:added', added);
+
+      const instance = createAIConversation({ provider: 'claude', cwd: '/tmp' });
+
+      expect(added).toHaveBeenCalledOnce();
+      expect(added.mock.calls[0][0].id).toBe(instance.getInstanceId());
+      expect(added.mock.calls[0][0].provider).toBe('claude');
+      expect(added.mock.calls[0][0].cwd).toBe('/tmp');
+    });
+
+    it('destroy() emits instance:removed exactly once and a subsequent exit does not re-emit', () => {
+      const removed = vi.fn();
+      const instance = createAIConversation({ provider: 'claude', cwd: '/tmp' });
+      instanceEvents.on('instance:removed', removed);
+
+      instance.destroy();
+      expect(removed).toHaveBeenCalledOnce();
+
+      fakeProc.emit('exit', 0);
+      expect(removed).toHaveBeenCalledOnce();
+    });
+
+    it("proc.emit('exit') without prior destroy emits instance:removed exactly once", () => {
+      const removed = vi.fn();
+      createAIConversation({ provider: 'claude', cwd: '/tmp' });
+      instanceEvents.on('instance:removed', removed);
+
+      fakeProc.emit('exit', 0);
+
+      expect(removed).toHaveBeenCalledOnce();
+    });
+
+    it("proc.emit('error') emits added then removed", () => {
+      const added = vi.fn();
+      const removed = vi.fn();
+      instanceEvents.on('instance:added', added);
+      instanceEvents.on('instance:removed', removed);
+
+      createAIConversation({
+        provider: 'claude',
+        cwd: '/tmp',
+        handlers: { onError: () => {} },
+      });
+
+      expect(added).toHaveBeenCalledOnce();
+      expect(removed).not.toHaveBeenCalled();
+
+      fakeProc.emit('error', new Error('ENOENT'));
+
+      expect(added).toHaveBeenCalledOnce();
+      expect(removed).toHaveBeenCalledOnce();
+      expect(removed.mock.calls[0][0].id).toBe(added.mock.calls[0][0].id);
     });
   });
 });

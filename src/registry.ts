@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import type { AIConversationInstance } from './types.js';
 
 export interface InstanceInfo {
@@ -18,14 +19,40 @@ export interface RegistryEntry {
   meta: unknown;
 }
 
+export interface InstanceEventMap {
+  'instance:added': [info: InstanceInfo];
+  'instance:removed': [info: InstanceInfo];
+}
+
+export const instanceEvents = new EventEmitter<InstanceEventMap>();
+
 const entries = new Map<string, RegistryEntry>();
 
+function buildInfo(entry: RegistryEntry): InstanceInfo {
+  return {
+    id: entry.instance.getInstanceId(),
+    provider: entry.provider,
+    cwd: entry.cwd,
+    sessionId: entry.instance.getSessionId(),
+    pid: entry.instance.getPid(),
+    createdAt: entry.createdAt,
+    meta: entry.meta,
+  };
+}
+
 export function register(entry: RegistryEntry): void {
-  entries.set(entry.instance.getInstanceId(), entry);
+  const id = entry.instance.getInstanceId();
+  if (entries.has(id)) return;
+  entries.set(id, entry);
+  instanceEvents.emit('instance:added', buildInfo(entry));
 }
 
 export function unregister(id: string): void {
+  const entry = entries.get(id);
+  if (!entry) return;
+  const snapshot = buildInfo(entry);
   entries.delete(id);
+  instanceEvents.emit('instance:removed', snapshot);
 }
 
 export function setMetaFor(id: string, value: unknown): void {
@@ -39,17 +66,7 @@ export function getMetaFor(id: string): unknown {
 
 export function listInstances(): InstanceInfo[] {
   const result: InstanceInfo[] = [];
-  for (const entry of entries.values()) {
-    result.push({
-      id: entry.instance.getInstanceId(),
-      provider: entry.provider,
-      cwd: entry.cwd,
-      sessionId: entry.instance.getSessionId(),
-      pid: entry.instance.getPid(),
-      createdAt: entry.createdAt,
-      meta: entry.meta,
-    });
-  }
+  for (const entry of entries.values()) result.push(buildInfo(entry));
   return result;
 }
 
@@ -60,4 +77,5 @@ export function getInstance(id: string): AIConversationInstance | undefined {
 /** Test-only. Not exported from the public API. */
 export function __resetForTests(): void {
   entries.clear();
+  instanceEvents.removeAllListeners();
 }

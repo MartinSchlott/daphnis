@@ -42,6 +42,9 @@ cannot be modelled without compromise is out of scope.
   instances. Per-instance `getInstanceId()`, `setMeta(value)`, and
   `getMeta<T>()` let callers hang an opaque payload on an instance and
   look it up without keeping their own map.
+  - `instanceEvents` — typed `EventEmitter<InstanceEventMap>` exposing
+    `instance:added` and `instance:removed`. Subscribers see lifecycle
+    transitions without polling `listInstances()`.
 - Uniform effort levels (`default | min | low | medium | high | xhigh |
   max`) mapped to the closest provider-supported gear.
 - Uniform `ConversationTurn` shape (`role`, `content`, `timestamp`).

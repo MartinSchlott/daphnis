@@ -9,7 +9,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 const { CodexCLIWrapper } = await import('../codex-cli-wrapper.js');
-const { __resetForTests, listInstances, getInstance } = await import('../registry.js');
+const { __resetForTests, listInstances, getInstance, instanceEvents } = await import('../registry.js');
 const { createAIConversation } = await import('../factory.js');
 
 const TEST_ID = 'test-id';
@@ -774,6 +774,88 @@ describe('CodexCLIWrapper', () => {
       // And the exit path (once the child actually dies) is a no-op for the registry
       fakeProc.emit('exit', 1);
       expect(listInstances()).toHaveLength(0);
+    });
+  });
+
+  describe('lifecycle events', () => {
+    it('construction emits instance:added exactly once', () => {
+      const added = vi.fn();
+      instanceEvents.on('instance:added', added);
+
+      const instance = createAIConversation({ provider: 'codex', cwd: '/tmp' });
+
+      expect(added).toHaveBeenCalledOnce();
+      expect(added.mock.calls[0][0].id).toBe(instance.getInstanceId());
+      expect(added.mock.calls[0][0].provider).toBe('codex');
+      expect(added.mock.calls[0][0].cwd).toBe('/tmp');
+
+      instance.destroy();
+    });
+
+    it('destroy() emits instance:removed exactly once and a subsequent exit does not re-emit', () => {
+      const removed = vi.fn();
+      const instance = createAIConversation({ provider: 'codex', cwd: '/tmp' });
+      instanceEvents.on('instance:removed', removed);
+
+      instance.destroy();
+      expect(removed).toHaveBeenCalledOnce();
+
+      fakeProc.emit('exit', 0);
+      expect(removed).toHaveBeenCalledOnce();
+    });
+
+    it("proc.emit('exit') without prior destroy emits instance:removed exactly once", () => {
+      const removed = vi.fn();
+      createAIConversation({ provider: 'codex', cwd: '/tmp', handlers: { onError: () => {} } });
+      instanceEvents.on('instance:removed', removed);
+
+      fakeProc.emit('exit', 0);
+
+      expect(removed).toHaveBeenCalledOnce();
+    });
+
+    it("proc.emit('error') emits added then removed", () => {
+      const added = vi.fn();
+      const removed = vi.fn();
+      instanceEvents.on('instance:added', added);
+      instanceEvents.on('instance:removed', removed);
+
+      createAIConversation({
+        provider: 'codex',
+        cwd: '/tmp',
+        handlers: { onError: () => {} },
+      });
+
+      expect(added).toHaveBeenCalledOnce();
+      expect(removed).not.toHaveBeenCalled();
+
+      fakeProc.emit('error', new Error('ENOENT'));
+
+      expect(added).toHaveBeenCalledOnce();
+      expect(removed).toHaveBeenCalledOnce();
+      expect(removed.mock.calls[0][0].id).toBe(added.mock.calls[0][0].id);
+    });
+
+    it('handshake failure emits added then removed', async () => {
+      const added = vi.fn();
+      const removed = vi.fn();
+      const onError = vi.fn();
+      instanceEvents.on('instance:added', added);
+      instanceEvents.on('instance:removed', removed);
+
+      createAIConversation({ provider: 'codex', cwd: '/tmp', handlers: { onError } });
+
+      expect(added).toHaveBeenCalledOnce();
+      expect(removed).not.toHaveBeenCalled();
+
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -1, message: 'init failed' } }) + '\n');
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      expect(added).toHaveBeenCalledOnce();
+      expect(removed).toHaveBeenCalledOnce();
+      expect(removed.mock.calls[0][0].id).toBe(added.mock.calls[0][0].id);
     });
   });
 });
