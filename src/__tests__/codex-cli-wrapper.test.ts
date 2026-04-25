@@ -1161,6 +1161,29 @@ describe('CodexCLIWrapper', () => {
       expect(removed.mock.calls[0][0].id).toBe(added.mock.calls[0][0].id);
     });
 
+    it('instance:ready fires exactly once after thread/start handshake (Codex)', async () => {
+      const ready = vi.fn();
+      const added = vi.fn();
+      instanceEvents.on('instance:added', added);
+      instanceEvents.on('instance:ready', ready);
+
+      const instance = createAIConversation({ provider: 'codex', cwd: '/tmp' });
+
+      // added fires synchronously in the constructor; ready waits for the
+      // async thread/start handshake to complete.
+      expect(added).toHaveBeenCalledOnce();
+      expect(ready).not.toHaveBeenCalled();
+
+      await completeInit('thread-ready-1');
+
+      expect(ready).toHaveBeenCalledOnce();
+      expect(ready.mock.calls[0][0].id).toBe(instance.getInstanceId());
+      expect(ready.mock.calls[0][0].provider).toBe('codex');
+      expect(ready.mock.calls[0][0].sessionId).toBe('thread-ready-1');
+
+      instance.destroy();
+    });
+
     it('handshake failure emits added then removed', async () => {
       const added = vi.fn();
       const removed = vi.fn();

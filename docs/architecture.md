@@ -246,23 +246,53 @@ registry observes lifecycle; it does not decide anything. No role
 management, no dispatch, no "send to the idle one" — that stays on the
 caller's side of the boundary.
 
-Lifecycle events ride on the same code paths. A module-level
-`EventEmitter<InstanceEventMap>` (`instanceEvents`) emits `instance:added`
-inside `register` after the entry is in the map, and `instance:removed`
-inside `unregister` after the entry is deleted. The `InstanceInfo`
-snapshot for `instance:removed` is built *before* the `Map.delete` call,
-so subscribers receive the final session id, pid, and meta even though
-the live wrapper is no longer reachable through `getInstance`. Emission
-fires only when the underlying mutation actually happened: a re-register
-of an existing id is a no-op (no second `instance:added`), and an
-`unregister` for an unknown id is a no-op (no orphan `instance:removed`).
-Dispatch is synchronous — `instance:added` fires before
-`createAIConversation()` returns, and an ENOENT or Codex handshake
-failure produces `instance:added` followed shortly by `instance:removed`
-because the wrapper registers before any async failure path can fire.
-Late subscribers do not receive replayed history; consumers compose
+Lifecycle events ride on the same code paths but emit from four
+distinct sites. A module-level `EventEmitter<InstanceEventMap>`
+(`instanceEvents`) exposes `instance:added`, `instance:removed`,
+`instance:ready`, and `instance:meta-changed`. All emissions are
+synchronous; late subscribers do not receive replayed history.
+
+`instance:added` fires inside `register` after the entry is in the map.
+`instance:removed` fires inside `unregister` after the entry is deleted —
+the `InstanceInfo` snapshot is built *before* the `Map.delete` call, so
+subscribers receive the final session id, pid, and meta even though the
+live wrapper is no longer reachable through `getInstance`. Both fire only
+when the underlying mutation actually happened: a re-register of an
+existing id is a no-op (no second `instance:added`), and an `unregister`
+for an unknown id is a no-op (no orphan `instance:removed`). Because the
+wrapper registers before any async failure path can fire, an ENOENT or
+Codex handshake failure produces `instance:added` followed shortly by
+`instance:removed`.
+
+`instance:ready` fires from a `registry.emitReady(id)` helper invoked by
+each wrapper immediately after its internal `ready` flag flips to `true`.
+For Claude this happens inside the constructor, after `instance:added`,
+so the `added → ready` order is observable on the same tick that
+`createAIConversation()` returns; `info.sessionId` is still `null`
+because `system/init` only arrives after the first user message. For
+Codex this happens later, after the `thread/start` / `thread/resume`
+handshake resolves, so subscribers see `instance:added` first and
+`instance:ready` only after the handshake completes — by which point
+`info.sessionId` already carries the captured `threadId`. The flag is
+set exactly once per instance lifetime; the event therefore fires at
+most once per id. A handshake failure produces `instance:added` →
+`instance:removed` with no intervening `instance:ready`.
+
+`instance:meta-changed` fires inside `setMetaFor` after the meta slot is
+overwritten, with payload `[info, prev]` — `info.meta` carries the new
+value, `prev` carries whatever was stored before. Suppressed for unknown
+ids (silent no-op preserved). Not emitted on initial `register` — the
+initial meta value is carried by the `instance:added` payload. No
+equality check between `prev` and the new value: every call emits, even
+if the caller hands in the exact same reference twice (filtering is the
+consumer's concern, since `unknown` has no meaningful equality).
+
+Listeners must not throw. Node's `EventEmitter` propagates synchronous
+throws back to the emit site, which on `instance:ready` sits inside the
+Claude constructor or the Codex async handshake, and on
+`instance:meta-changed` sits inside `setMeta`. Consumers compose
 `listInstances()` with `instanceEvents.on('instance:added', …)` for full
-coverage.
+coverage of pre-existing plus new instances.
 
 ### Interrupt protocol
 

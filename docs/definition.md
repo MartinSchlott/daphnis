@@ -44,8 +44,9 @@ cannot be modelled without compromise is out of scope.
   `getMeta<T>()` let callers hang an opaque payload on an instance and
   look it up without keeping their own map.
   - `instanceEvents` — typed `EventEmitter<InstanceEventMap>` exposing
-    `instance:added` and `instance:removed`. Subscribers see lifecycle
-    transitions without polling `listInstances()`.
+    `instance:added`, `instance:removed`, `instance:ready`, and
+    `instance:meta-changed`. Subscribers see lifecycle transitions and
+    meta updates without polling `listInstances()` / `getSessionId()`.
 - Uniform effort levels (`default | min | low | medium | high | xhigh |
   max`) mapped to the closest provider-supported gear.
 - Uniform `ConversationTurn` shape (`role`, `content`, `timestamp`).

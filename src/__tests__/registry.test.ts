@@ -262,5 +262,62 @@ describe('registry', () => {
 
       expect(listener).not.toHaveBeenCalled();
     });
+
+    it("'instance:meta-changed' fires with (info, prev) carrying old and new meta", () => {
+      const fake = makeFake({ id: 'm1', sessionId: 'sess-m', pid: 333 });
+      const createdAt = new Date('2025-03-03T00:00:00Z');
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt, meta: { v: 1 } });
+
+      const listener = vi.fn();
+      instanceEvents.on('instance:meta-changed', listener);
+
+      setMetaFor('m1', { v: 2 });
+
+      expect(listener).toHaveBeenCalledOnce();
+      const [info, prev] = listener.mock.calls[0];
+      expect(info).toEqual({
+        id: 'm1',
+        provider: 'claude',
+        cwd: '/w',
+        sessionId: 'sess-m',
+        pid: 333,
+        createdAt,
+        meta: { v: 2 },
+      });
+      expect(prev).toEqual({ v: 1 });
+    });
+
+    it("'instance:meta-changed' fires on every call (no equality check)", () => {
+      const fake = makeFake({ id: 'm2' });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: undefined });
+
+      const listener = vi.fn();
+      instanceEvents.on('instance:meta-changed', listener);
+
+      const same = { x: 1 };
+      setMetaFor('m2', same);
+      setMetaFor('m2', same);
+
+      expect(listener).toHaveBeenCalledTimes(2);
+    });
+
+    it("'instance:meta-changed' does not fire for unknown id", () => {
+      const listener = vi.fn();
+      instanceEvents.on('instance:meta-changed', listener);
+
+      setMetaFor('nope', { any: 'thing' });
+
+      expect(listener).not.toHaveBeenCalled();
+    });
+
+    it("'instance:meta-changed' does not fire on initial register", () => {
+      const listener = vi.fn();
+      instanceEvents.on('instance:meta-changed', listener);
+
+      const fake = makeFake({ id: 'm3' });
+      register({ instance: fake, provider: 'claude', cwd: '/w', createdAt: new Date(), meta: { initial: true } });
+
+      expect(listener).not.toHaveBeenCalled();
+    });
   });
 });

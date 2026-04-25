@@ -3,7 +3,7 @@ import type { AIConversationInstance, AIConversationHandlers, ConversationTurn, 
 import { NdjsonParser } from './ndjson-parser.js';
 import { effortToCodexValue } from './effort-mapping.js';
 import { loadSessionHistory } from './sessions.js';
-import { register, unregister, setMetaFor, getMetaFor } from './registry.js';
+import { register, unregister, setMetaFor, getMetaFor, emitReady } from './registry.js';
 
 const ENV_BLACKLIST = new Set([
   'NODE_OPTIONS',
@@ -171,6 +171,7 @@ export class CodexCLIWrapper implements AIConversationInstance {
         { thread: { id: string } };
       this.threadId = threadResult.thread.id;
       this.ready = true;
+      emitReady(this.instanceId);
       this.onReady();
     } catch (err) {
       this.onError(err instanceof Error ? err : new Error(String(err)));

@@ -4,7 +4,7 @@ import type { AIConversationInstance, AIConversationHandlers, ConversationTurn, 
 import { NdjsonParser } from './ndjson-parser.js';
 import { effortToClaudeFlag } from './effort-mapping.js';
 import { loadSessionHistory } from './sessions.js';
-import { register, unregister, setMetaFor, getMetaFor } from './registry.js';
+import { register, unregister, setMetaFor, getMetaFor, emitReady } from './registry.js';
 
 const ENV_BLACKLIST = new Set([
   'NODE_OPTIONS',
@@ -172,6 +172,7 @@ export class ClaudeCLIWrapper implements AIConversationInstance {
     // Ready immediately — the CLI is alive and accepts stdin. The system/init
     // event only arrives after the first user message, so we cannot wait for it.
     this.ready = true;
+    emitReady(this.instanceId);
     this.onReady();
   }
 

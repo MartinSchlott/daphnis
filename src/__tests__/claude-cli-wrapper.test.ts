@@ -869,5 +869,27 @@ describe('ClaudeCLIWrapper', () => {
       expect(removed).toHaveBeenCalledOnce();
       expect(removed.mock.calls[0][0].id).toBe(added.mock.calls[0][0].id);
     });
+
+    it('construction emits instance:ready exactly once with InstanceInfo', () => {
+      const ready = vi.fn();
+      instanceEvents.on('instance:ready', ready);
+
+      const instance = createAIConversation({ provider: 'claude', cwd: '/tmp' });
+
+      expect(ready).toHaveBeenCalledOnce();
+      expect(ready.mock.calls[0][0].id).toBe(instance.getInstanceId());
+      expect(ready.mock.calls[0][0].provider).toBe('claude');
+      expect(ready.mock.calls[0][0].cwd).toBe('/tmp');
+    });
+
+    it('instance:added fires before instance:ready (Claude)', () => {
+      const order: string[] = [];
+      instanceEvents.on('instance:added', () => order.push('added'));
+      instanceEvents.on('instance:ready', () => order.push('ready'));
+
+      createAIConversation({ provider: 'claude', cwd: '/tmp' });
+
+      expect(order).toEqual(['added', 'ready']);
+    });
   });
 });

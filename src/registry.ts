@@ -22,6 +22,8 @@ export interface RegistryEntry {
 export interface InstanceEventMap {
   'instance:added': [info: InstanceInfo];
   'instance:removed': [info: InstanceInfo];
+  'instance:ready': [info: InstanceInfo];
+  'instance:meta-changed': [info: InstanceInfo, prev: unknown];
 }
 
 export const instanceEvents = new EventEmitter<InstanceEventMap>();
@@ -57,7 +59,16 @@ export function unregister(id: string): void {
 
 export function setMetaFor(id: string, value: unknown): void {
   const entry = entries.get(id);
-  if (entry) entry.meta = value;
+  if (!entry) return;
+  const prev = entry.meta;
+  entry.meta = value;
+  instanceEvents.emit('instance:meta-changed', buildInfo(entry), prev);
+}
+
+export function emitReady(id: string): void {
+  const entry = entries.get(id);
+  if (!entry) return;
+  instanceEvents.emit('instance:ready', buildInfo(entry));
 }
 
 export function getMetaFor(id: string): unknown {
