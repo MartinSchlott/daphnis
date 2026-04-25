@@ -13,3 +13,13 @@ coverage/
 .DS_Store
 .env
 .env.*
+.claude/skills/cortex-md/SKILL.md
+.claude/skills/cortex-md/audit.md
+.claude/skills/cortex-md/examples/monorepo.md
+.claude/skills/cortex-md/examples/static.md
+.claude/skills/cortex-md/examples/webapp-systemd.md
+.claude/skills/cortex-md/sections.md
+.claude/skills/markdown-kanban/SKILL.md
+.claude/skills/markdown-kanban/references/KANBAN_MARKDOWN_FORMAT.md
+.claude/skills/markdown-kanban/templates/backlog.kanban.md
+.claude/skills/markdown-kanban/templates/bug.kanban.md
