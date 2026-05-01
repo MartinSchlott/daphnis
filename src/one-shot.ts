@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Effort } from './types.js';
 import { effortToClaudeFlag, effortToCodexValue } from './effort-mapping.js';
+import { assertSupportedProvider } from './providers.js';
 
 const ENV_BLACKLIST = new Set([
   'NODE_OPTIONS',
@@ -80,6 +81,7 @@ export interface OneShotResult<T = unknown> {
 export async function runOneShotPrompt<T = unknown>(
   options: OneShotOptions,
 ): Promise<OneShotResult<T>> {
+  assertSupportedProvider(options.provider);
   switch (options.provider) {
     case 'claude':
       return runClaudeOneShot<T>(options);

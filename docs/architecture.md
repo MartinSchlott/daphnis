@@ -26,6 +26,7 @@ daphnis/
 │   ├── one-shot.ts           # runOneShotPrompt for both providers
 │   ├── sessions.ts           # listSessions + loadSessionHistory
 │   ├── registry.ts           # listInstances, getInstance, meta slot
+│   ├── providers.ts          # listSupportedProviders, checkProvider
 │   ├── effort-mapping.ts     # Effort → provider flag
 │   ├── ndjson-parser.ts      # line-buffered NDJSON
 │   └── __tests__/            # vitest, excluded from build
@@ -48,6 +49,8 @@ Flat layout, single package. No monorepo, no workspaces.
 - `listSessions` + `SessionInfo`
 - `listInstances`, `getInstance`, `instanceEvents` + `InstanceInfo`,
   `InstanceEventMap`, `InstanceState`
+- `listSupportedProviders`, `checkProvider` + `ProviderCheckResult`,
+  `CheckProviderOptions`
 
 Nothing else is exported. Internal helpers (NDJSON parser, effort mapping)
 are implementation detail.
@@ -227,6 +230,32 @@ requests, fixed read/write/network/macOS grants for the permissions
 request). That layer is required for the `app-server` handshake to
 make progress without a human in the loop and is independent of this
 option.
+
+### Preflight as binary probe only
+
+`checkProvider(name)` spawns `<binary> --version` and resolves with a
+result object. It does not invoke the model and does not touch
+authentication — auth remains out of scope per `definition.md`. A
+caller who needs end-to-end verification (model reachable, auth
+configured) composes `runOneShotPrompt` with a minimal prompt; the
+preflight does not encapsulate that decision.
+
+Probe-flag is hardcoded to `--version` because both supported CLIs
+honour the convention. When a provider with a different convention
+is added, the per-provider probe config moves into a `providers.ts`
+map; this is a bounded follow-up, not a current concern.
+
+Unknown provider names throw synchronously rather than resolving to
+`{available: false}`. A non-supported name is a programming error,
+not a runtime reachability condition — same stance as
+`factory.ts`'s switch default.
+
+`SUPPORTED_PROVIDERS` in `providers.ts` is the single runtime source of
+truth for which provider names Daphnis accepts. Both entry points
+(`createAIConversation`, `runOneShotPrompt`) call
+`assertSupportedProvider` against this list before their internal
+provider switch, and `listSupportedProviders` returns its contents.
+The list cannot drift from "what Daphnis actually accepts."
 
 ### Instance registry
 

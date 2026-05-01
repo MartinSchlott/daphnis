@@ -2,9 +2,11 @@ import { randomUUID } from 'node:crypto';
 import type { AIConversationInstance, AIConversationOptions } from './types.js';
 import { ClaudeCLIWrapper } from './claude-cli-wrapper.js';
 import { CodexCLIWrapper } from './codex-cli-wrapper.js';
+import { assertSupportedProvider } from './providers.js';
 
 export function createAIConversation(options: AIConversationOptions): AIConversationInstance {
-  const binary = options.binary ?? (options.provider === 'claude' ? 'claude' : 'codex');
+  assertSupportedProvider(options.provider);
+  const binary = options.binary ?? options.provider;
   const id = randomUUID();
   switch (options.provider) {
     case 'claude':
@@ -20,6 +22,6 @@ export function createAIConversation(options: AIConversationOptions): AIConversa
         options.fullAccess, options.extraArgs,
       );
     default:
-      throw new Error(`Unknown provider: ${options.provider}`);
+      throw new Error(`Unknown provider: ${options.provider as string}`);
   }
 }

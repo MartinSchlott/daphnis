@@ -12,3 +12,5 @@ export { listSessions } from './sessions.js';
 export type { SessionInfo } from './sessions.js';
 export { listInstances, getInstance, instanceEvents } from './registry.js';
 export type { InstanceInfo, InstanceEventMap, InstanceState } from './registry.js';
+export { listSupportedProviders, checkProvider } from './providers.js';
+export type { ProviderCheckResult, CheckProviderOptions } from './providers.js';

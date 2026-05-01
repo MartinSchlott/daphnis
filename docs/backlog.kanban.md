@@ -9,6 +9,32 @@ id: vu6ntxrwrntgs4n17elgj33u
 ## Open
 id: h6co89r6x8vq2ileek28kxyi
 
+### Consolidate ENV_BLACKLIST + filterEnv into a shared module
+id: {new}
+priority: low
+
+`ENV_BLACKLIST` and `filterEnv()` are duplicated across
+`claude-cli-wrapper.ts`, `codex-cli-wrapper.ts`, `one-shot.ts`, and
+(after PLAN_preflight) `providers.ts`. Extract to `src/env-filter.ts`
+and import from all four. No behaviour change, pure refactor.
+
+### Loosen provider type from union to string
+id: {new}
+priority: medium
+
+After PLAN_preflight, `SUPPORTED_PROVIDERS` in `src/providers.ts` is
+the central runtime list. The TypeScript type at the call sites
+(`AIConversationOptions.provider`, `OneShotOptions.provider`,
+`InstanceInfo.provider`, `RegistryEntry.provider`, `listSessions` and
+`loadSessionHistory` parameters) is still the literal union
+`'claude' | 'codex'`. Loosen these to `string` (or to a derived
+type-alias re-exported from `providers.ts`) so a third provider can
+be added without a public-API breaking change at the type level. The
+runtime validation is already centralised via
+`assertSupportedProvider`. Breaking change at the type level —
+needs its own plan with explicit verification of consumer
+compatibility.
+
 ## In Progress
 id: j1rji73h7kju0kjp3avcbqdm
 

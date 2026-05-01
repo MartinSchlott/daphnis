@@ -55,6 +55,11 @@ cannot be modelled without compromise is out of scope.
     the current lifecycle state (`spawning | ready | busy | exiting`),
     and `InstanceInfo.exitCode` carries the child's exit code (`null`
     until the child has actually exited).
+- `listSupportedProviders()` / `checkProvider(name)` — preflight
+  surface. `listSupportedProviders()` returns the static list of
+  provider names. `checkProvider` spawns `<binary> --version` as a
+  lightweight binary-reachability probe (no model call, no auth).
+  Throws on unknown provider names.
 - Uniform effort levels (`default | min | low | medium | high | xhigh |
   max`) mapped to the closest provider-supported gear.
 - Uniform `ConversationTurn` shape (`role`, `content`, `timestamp`).
@@ -113,7 +118,8 @@ cannot be modelled without compromise is out of scope.
   changing any other option, and both work.
 - The entire public API fits in `src/index.ts` without re-exports from
   deep modules.
-- Adding a third provider would require one new file plus a branch in
-  `factory.ts` and `one-shot.ts` — nothing else.
+- Adding a third provider would require one new file, an entry in
+  `SUPPORTED_PROVIDERS` in `providers.ts`, plus a branch in `factory.ts`
+  and `one-shot.ts` — nothing else.
 - No hidden side effects: spawn, read stdio, parse, call back. That is
   the whole contract.

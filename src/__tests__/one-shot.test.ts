@@ -56,6 +56,19 @@ beforeEach(() => {
   rmSpy.mockClear();
 });
 
+describe('runOneShotPrompt — guard', () => {
+  it('rejects for unknown provider without spawning', async () => {
+    await expect(
+      runOneShotPrompt({
+        provider: 'unknown' as 'claude',
+        cwd: '/tmp',
+        prompt: 'hi',
+      }),
+    ).rejects.toThrow('Unknown provider: unknown');
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+});
+
 describe('runOneShotPrompt — claude', () => {
   it('resolves with text and session id when envelope carries no structured output', async () => {
     const proc = createFakeProcess();
