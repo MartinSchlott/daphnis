@@ -4,6 +4,7 @@ export type {
   ConversationTurn,
   Effort,
   InstanceMessageEventMap,
+  MumbleCallback,
 } from './types.js';
 export { createAIConversation } from './factory.js';
 export { runOneShotPrompt } from './one-shot.js';

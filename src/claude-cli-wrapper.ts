@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import type { AIConversationInstance, ConversationTurn, Effort, InstanceMessageEventMap } from './types.js';
+import type { AIConversationInstance, ConversationTurn, Effort, InstanceMessageEventMap, MumbleCallback } from './types.js';
 import { NdjsonParser } from './ndjson-parser.js';
 import { effortToClaudeFlag } from './effort-mapping.js';
 import { loadSessionHistory } from './sessions.js';
@@ -19,6 +19,9 @@ const ENV_BLACKLIST = new Set([
   'ELECTRON_RUN_AS_NODE',
   'CLAUDECODE',
 ]);
+
+const MUMBLE_THROTTLE_MS = 1000;
+const MUMBLE_SAMPLE_CHARS = 120;
 
 function filterEnv(): Record<string, string> {
   const result: Record<string, string> = {};
@@ -46,6 +49,10 @@ export class ClaudeCLIWrapper
   private interrupting = false;
   private busyClearedResolve: (() => void) | null = null;
   private busyClearedReject: ((e: Error) => void) | null = null;
+  private mumbleCb: MumbleCallback | undefined;
+  private mumbleBuffer = '';
+  private mumbleLastEmitAt = 0;
+  private mumbleTimer: NodeJS.Timeout | null = null;
 
   readonly ready: Promise<void>;
   private resolveReady!: () => void;
@@ -143,6 +150,7 @@ export class ClaudeCLIWrapper
       // branch — including spawning, where leaving the child alive would
       // orphan the process.
       this.destroy();
+      this.mumbleResetTurn();
       // 'exit' may not fire after 'error' (Node docs); self-unregister.
       unregister(this.instanceId);
     });
@@ -166,6 +174,7 @@ export class ClaudeCLIWrapper
       if (cur !== 'exiting') {
         transitionState(this.instanceId, 'exiting');
       }
+      this.mumbleResetTurn();
       setExitCodeFor(this.instanceId, code);
       unregister(this.instanceId);
     });
@@ -180,6 +189,7 @@ export class ClaudeCLIWrapper
         this.safeEmitError(err);
       }
       this.destroy();
+      this.mumbleResetTurn();
       // 'exit' may not fire after 'error' (Node docs); self-unregister.
       unregister(this.instanceId);
     });
@@ -253,6 +263,7 @@ export class ClaudeCLIWrapper
         // sendMessage, which would fail with "Already processing" if state
         // is still busy.
         transitionState(this.instanceId, 'ready');
+        this.mumbleResetTurn();
 
         if (this.interrupting) {
           this.interrupting = false;
@@ -298,9 +309,24 @@ export class ClaudeCLIWrapper
         }
         break;
       }
-      case 'assistant':
-        // Intermediate verbose output — ignore in v1
+      case 'assistant': {
+        if (!this.mumbleCb) break;
+        if (getState(this.instanceId) !== 'busy') break;
+        const message = msg['message'] as Record<string, unknown> | undefined;
+        const content = message?.['content'];
+        if (!Array.isArray(content)) break;
+        for (const block of content) {
+          if (typeof block !== 'object' || block === null) continue;
+          const b = block as Record<string, unknown>;
+          const type = b['type'];
+          if (type === 'text' && typeof b['text'] === 'string') {
+            this.mumbleAppend(b['text']);
+          } else if (type === 'thinking' && typeof b['thinking'] === 'string') {
+            this.mumbleAppend(b['thinking']);
+          }
+        }
         break;
+      }
       default:
         // Forward compatibility — ignore unknown types
         break;
@@ -391,6 +417,60 @@ export class ClaudeCLIWrapper
     return getMetaFor(this.instanceId) as T | undefined;
   }
 
+  setMumble(cb: MumbleCallback | undefined): void {
+    this.mumbleCb = cb;
+    if (cb === undefined) {
+      if (this.mumbleTimer) {
+        clearTimeout(this.mumbleTimer);
+        this.mumbleTimer = null;
+      }
+      this.mumbleBuffer = '';
+      this.mumbleLastEmitAt = 0;
+    }
+  }
+
+  private mumbleAppend(text: string): void {
+    if (!this.mumbleCb) return;
+    if (text.length === 0) return;
+    this.mumbleBuffer += text;
+    this.scheduleMumble();
+  }
+
+  private scheduleMumble(): void {
+    if (!this.mumbleCb) return;
+    if (this.mumbleTimer) return;
+    let wait: number;
+    if (this.mumbleLastEmitAt === 0) {
+      wait = MUMBLE_THROTTLE_MS;
+    } else {
+      const elapsed = Date.now() - this.mumbleLastEmitAt;
+      wait = Math.max(0, MUMBLE_THROTTLE_MS - elapsed);
+    }
+    this.mumbleTimer = setTimeout(() => this.fireMumble(), wait);
+  }
+
+  private fireMumble(): void {
+    this.mumbleTimer = null;
+    const cb = this.mumbleCb;
+    if (!cb) return;
+    if (this.mumbleBuffer.length === 0) return;
+    const sample = this.mumbleBuffer.slice(-MUMBLE_SAMPLE_CHARS);
+    const msSinceLast = this.mumbleLastEmitAt === 0
+      ? 0
+      : Date.now() - this.mumbleLastEmitAt;
+    this.mumbleLastEmitAt = Date.now();
+    try { cb(sample, msSinceLast); } catch { /* swallow */ }
+  }
+
+  private mumbleResetTurn(): void {
+    if (this.mumbleTimer) {
+      clearTimeout(this.mumbleTimer);
+      this.mumbleTimer = null;
+    }
+    this.mumbleBuffer = '';
+    this.mumbleLastEmitAt = 0;
+  }
+
   async interrupt(): Promise<void> {
     const cur = getState(this.instanceId);
     if (cur === 'exiting') throw new Error('Destroyed');
@@ -430,6 +510,7 @@ export class ClaudeCLIWrapper
     const cur = getState(this.instanceId);
     if (cur === 'exiting') return;
     transitionState(this.instanceId, 'exiting');
+    this.mumbleResetTurn();
 
     const destroyedErr = new Error('Destroyed');
     this.rejectPendingControl(destroyedErr);

@@ -1180,6 +1180,164 @@ describe('CodexCLIWrapper', () => {
     });
   });
 
+  describe('Mumble', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(0));
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function deltaFrame(delta: string) {
+      return JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'item/agentMessage/delta',
+        params: { delta },
+      }) + '\n';
+    }
+
+    function turnCompletedFrame(status = 'completed') {
+      return JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'turn/completed',
+        params: { threadId: 'thread-abc', turn: { status } },
+      }) + '\n';
+    }
+
+    async function completeInitFake(threadId = 'thread-abc') {
+      await vi.advanceTimersByTimeAsync(0);
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) + '\n');
+      await vi.advanceTimersByTimeAsync(0);
+      feedStdout(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { thread: { id: threadId } } }) + '\n');
+      await vi.advanceTimersByTimeAsync(0);
+    }
+
+    async function startBusyWrapper(): Promise<{
+      wrapper: InstanceType<typeof CodexCLIWrapper>;
+      stdinChunks: string[];
+    }> {
+      const stdinChunks = captureStdin(fakeProc);
+      const wrapper = new CodexCLIWrapper('codex', '/tmp', TEST_ID);
+      await completeInitFake();
+      await wrapper.ready;
+      const sendPromise = wrapper.sendMessage('hi');
+      sendPromise.catch(() => {});
+      await vi.advanceTimersByTimeAsync(0);
+      const turnMsg = parseCapturedMessages(stdinChunks).find(m => m['method'] === 'turn/start');
+      feedStdout(JSON.stringify({
+        jsonrpc: '2.0',
+        id: turnMsg!['id'],
+        result: { turn: { id: 'turn-x' } },
+      }) + '\n');
+      await sendPromise;
+      return { wrapper, stdinChunks };
+    }
+
+    it('setMumble undefined → no callback fires', async () => {
+      const { wrapper } = await startBusyWrapper();
+      feedStdout(deltaFrame('hello'));
+      await vi.advanceTimersByTimeAsync(2000);
+      // No callback registered — ensure no throws.
+      expect(true).toBe(true);
+      wrapper.destroy();
+    });
+
+    it('delta content reaches the callback', async () => {
+      const { wrapper } = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      feedStdout(deltaFrame('hello world'));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledOnce();
+      expect(cb.mock.calls[0][0]).toContain('hello world');
+      wrapper.destroy();
+    });
+
+    it('throttled to 1 Hz across burst frames', async () => {
+      const { wrapper } = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      for (let i = 0; i < 5; i++) {
+        feedStdout(deltaFrame(`chunk${i} `));
+      }
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledOnce();
+      const sample = cb.mock.calls[0][0] as string;
+      expect(sample).toContain('chunk0');
+      expect(sample).toContain('chunk4');
+      wrapper.destroy();
+    });
+
+    it('bursting deltas produce a single mumble within 1 s', async () => {
+      const { wrapper } = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      for (let i = 0; i < 30; i++) {
+        feedStdout(deltaFrame(`tok${i} `));
+      }
+      await vi.advanceTimersByTimeAsync(999);
+      expect(cb).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(cb).toHaveBeenCalledOnce();
+      wrapper.destroy();
+    });
+
+    it('tail is at most 120 chars', async () => {
+      const { wrapper } = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      const longText = 'a'.repeat(250);
+      feedStdout(deltaFrame(longText));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledOnce();
+      expect((cb.mock.calls[0][0] as string).length).toBeLessThanOrEqual(120);
+      wrapper.destroy();
+    });
+
+    it('msSinceLast is 0 on first emit, ~1000 on second', async () => {
+      const { wrapper } = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+
+      feedStdout(deltaFrame('one'));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(cb.mock.calls[0][1]).toBe(0);
+
+      feedStdout(deltaFrame('two'));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledTimes(2);
+      expect(cb.mock.calls[1][1]).toBe(1000);
+      wrapper.destroy();
+    });
+
+    it('terminator clears pending timer', async () => {
+      const { wrapper } = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      feedStdout(deltaFrame('partial'));
+      await vi.advanceTimersByTimeAsync(500);
+      expect(cb).not.toHaveBeenCalled();
+
+      feedStdout(turnCompletedFrame('completed'));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).not.toHaveBeenCalled();
+      wrapper.destroy();
+    });
+
+    it('mumble does not fire after destroy', async () => {
+      const { wrapper } = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      feedStdout(deltaFrame('partial'));
+      wrapper.destroy();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(cb).not.toHaveBeenCalled();
+    });
+  });
+
   describe('late terminator after teardown', () => {
     it('turn/completed arriving after destroy() while busy is dropped silently', async () => {
       const stdinChunks = captureStdin(fakeProc);

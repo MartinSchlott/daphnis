@@ -467,6 +467,57 @@ rejection is the canonical channel for `sendMessage` failures
 stdin / JSON-RPC errors). The `'error'` event covers failures that have
 no callsite to reject.
 
+### Mumble side-channel
+
+`setMumble(cb)` is a per-instance opt-in callback slot for intermediate
+generation output. It is deliberately **not** an `EventEmitter` event:
+keeping it as a callback slot makes the "no listener → no work"
+guarantee trivially enforceable (no buffer is built, no timer armed
+when `mumbleCb` is `undefined`) and avoids growing the options object
+with mumble-specific knobs.
+
+**Hardcoded constants.** Throttle window is 1000 ms, sample length is
+120 chars. Both providers duplicate the constants locally — same
+pattern as `ENV_BLACKLIST` — to keep the wrappers self-contained.
+
+**Inclusion rules.**
+
+- **Claude** parses the previously-ignored `assistant` frame's
+  `message.content` block array. `text` blocks contribute their
+  `.text`, `thinking` blocks contribute their `.thinking`. `tool_use`
+  and other block types are skipped — JSON tool argument payloads are
+  noise, not mumble. Schema deviations (missing fields, unknown block
+  types) silently degrade fidelity but never throw.
+- **Codex** appends each `item/agentMessage/delta`'s `delta` text. No
+  `thinking` equivalent on this side; the asymmetry is accepted.
+
+**Lifecycle.** Mumble fires only while `state === 'busy'`. The state
+gate sits in front of the parser branch on Claude and in front of
+`mumbleAppend` on Codex — late frames after teardown cannot schedule
+against a dead wrapper. `mumbleResetTurn()` runs on every `busy →
+ready` transition (terminator), inside `destroy()`, on `proc.on('exit')`,
+and on the `proc.on('error')` / `stdin.on('error')` paths in both
+wrappers — covering every teardown route uniformly. The reset clears
+the buffer, cancels the pending throttle timer, and zeroes
+`mumbleLastEmitAt`.
+
+**Throttle behaviour.** The first emit of a turn is delayed by a full
+throttle window (1000 ms) so the buffer can fill — emitting on the
+first byte would degrade mumble into a token-stream. Subsequent emits
+use real elapsed time, capped at 1 Hz. Bursting deltas (Codex can fire
+20–30/s) coalesce into a single emit; the buffer is never drained, so
+each emit's sample is the running tail of all output so far in the
+turn.
+
+**Listener-throw policy.** A user callback that throws is caught and
+silently swallowed. The mumble channel is best-effort, not a control
+plane — a misbehaving callback must not destabilise the parser path.
+
+**Cadence asymmetry.** Codex deltas are token-grained; Claude
+`assistant` frames are coarser (roughly per content block). Consumers
+must not depend on cadence parity between providers, only on the
+"≤ 1 Hz, only while busy, opaque tail" contract.
+
 ### Interrupt protocol
 
 `AIConversationInstance.interrupt()` cancels the in-flight turn while

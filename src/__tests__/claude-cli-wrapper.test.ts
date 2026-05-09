@@ -1034,6 +1034,139 @@ describe('ClaudeCLIWrapper', () => {
     });
   });
 
+  describe('Mumble', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(0));
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function assistantFrame(blocks: unknown[]) {
+      return JSON.stringify({ type: 'assistant', message: { content: blocks } }) + '\n';
+    }
+
+    async function startBusyWrapper(): Promise<InstanceType<typeof ClaudeCLIWrapper>> {
+      const wrapper = new ClaudeCLIWrapper('claude', '/tmp', TEST_ID);
+      await vi.advanceTimersToNextTimerAsync();
+      await wrapper.ready;
+      wrapper.sendMessage('q').catch(() => {});
+      return wrapper;
+    }
+
+    it('setMumble undefined → no callback fires', async () => {
+      const wrapper = await startBusyWrapper();
+      // No setMumble call — push assistant frame and advance time.
+      feedStdout(assistantFrame([{ type: 'text', text: 'hello' }]));
+      await vi.advanceTimersByTimeAsync(2000);
+      // Nothing to assert beyond the absence of throws — there is no callback.
+      expect(true).toBe(true);
+      wrapper.destroy();
+    });
+
+    it('text-block content reaches the callback', async () => {
+      const wrapper = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      feedStdout(assistantFrame([{ type: 'text', text: 'hello world' }]));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledOnce();
+      expect(cb.mock.calls[0][0]).toContain('hello world');
+      wrapper.destroy();
+    });
+
+    it('thinking-block content reaches the callback', async () => {
+      const wrapper = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      feedStdout(assistantFrame([{ type: 'thinking', thinking: 'pondering...' }]));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledOnce();
+      expect(cb.mock.calls[0][0]).toContain('pondering...');
+      wrapper.destroy();
+    });
+
+    it('tool_use blocks are skipped', async () => {
+      const wrapper = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      feedStdout(assistantFrame([{ type: 'tool_use', id: 't1', name: 'edit', input: {} }]));
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(cb).not.toHaveBeenCalled();
+      wrapper.destroy();
+    });
+
+    it('throttled to 1 Hz across burst frames', async () => {
+      const wrapper = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      for (let i = 0; i < 5; i++) {
+        feedStdout(assistantFrame([{ type: 'text', text: `chunk${i} ` }]));
+      }
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledOnce();
+      const sample = cb.mock.calls[0][0] as string;
+      expect(sample).toContain('chunk0');
+      expect(sample).toContain('chunk4');
+      wrapper.destroy();
+    });
+
+    it('tail is at most 120 chars', async () => {
+      const wrapper = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      const longText = 'a'.repeat(250);
+      feedStdout(assistantFrame([{ type: 'text', text: longText }]));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledOnce();
+      expect((cb.mock.calls[0][0] as string).length).toBeLessThanOrEqual(120);
+      wrapper.destroy();
+    });
+
+    it('msSinceLast is 0 on first emit, ~1000 on second', async () => {
+      const wrapper = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+
+      feedStdout(assistantFrame([{ type: 'text', text: 'one' }]));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(cb.mock.calls[0][1]).toBe(0);
+
+      feedStdout(assistantFrame([{ type: 'text', text: 'two' }]));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).toHaveBeenCalledTimes(2);
+      expect(cb.mock.calls[1][1]).toBe(1000);
+      wrapper.destroy();
+    });
+
+    it('terminator clears pending timer', async () => {
+      const wrapper = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      feedStdout(assistantFrame([{ type: 'text', text: 'partial' }]));
+      await vi.advanceTimersByTimeAsync(500);
+      expect(cb).not.toHaveBeenCalled();
+
+      feedStdout(resultEvent('done'));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(cb).not.toHaveBeenCalled();
+      wrapper.destroy();
+    });
+
+    it('mumble does not fire after destroy', async () => {
+      const wrapper = await startBusyWrapper();
+      const cb = vi.fn();
+      wrapper.setMumble(cb);
+      feedStdout(assistantFrame([{ type: 'text', text: 'partial' }]));
+      wrapper.destroy();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(cb).not.toHaveBeenCalled();
+    });
+  });
+
   describe("error path during 'spawning' kills the child", () => {
     it("proc.on('error') during spawning schedules SIGKILL", async () => {
       vi.useFakeTimers();

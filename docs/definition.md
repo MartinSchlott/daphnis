@@ -71,6 +71,12 @@ cannot be modelled without compromise is out of scope.
   `extraArgs: string[]` is a verbatim pass-through for everything we
   deliberately do not abstract. Both apply uniformly to persistent
   sessions and one-shot.
+- `setMumble(cb)` per instance — opt-in side-channel for intermediate
+  generation. The callback receives an opaque ~120-char text tail and
+  the milliseconds since the previous emit. Throttled to ≤ 1 emit /
+  second; fires only while the instance is `busy`. Pass `undefined`
+  to disable. The sample is for human eyes only — consumers must not
+  parse it.
 
 ### Out of scope (deliberately)
 
@@ -103,8 +109,9 @@ cannot be modelled without compromise is out of scope.
   by `sessionId` (Claude) / `threadId` (Codex), both exposed uniformly as
   `getSessionId()`.
 - **Turn** — `{ role: 'user' | 'assistant', content: string, timestamp:
-  Date }`. Intermediate tool-use / reasoning events are not surfaced in
-  v1.
+  Date }`. Intermediate tool-use / reasoning events are not surfaced as
+  structured events; the `setMumble` side-channel exposes them only as
+  opaque text samples for human-visible progress indication.
 - **Effort** — abstract reasoning level, mapped per provider. `'default'`
   passes no flag and lets the CLI decide.
 - **Instance** — a live `AIConversationInstance` produced by

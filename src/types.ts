@@ -13,6 +13,8 @@ export interface InstanceMessageEventMap {
   error:        [err: Error];
 }
 
+export type MumbleCallback = (sample: string, msSinceLast: number) => void;
+
 export interface AIConversationInstance
   extends EventEmitter<InstanceMessageEventMap> {
   readonly ready: Promise<void>;
@@ -51,6 +53,19 @@ export interface AIConversationInstance
   setMeta(value: unknown): void;
   /** Unchecked cast — the registry stores meta as `unknown`. */
   getMeta<T = unknown>(): T | undefined;
+
+  /**
+   * Register an opt-in side-channel for intermediate generation output.
+   * The callback is invoked at most once per second while a turn is in
+   * flight. `sample` is an opaque tail snippet (~120 chars) of what the
+   * model is producing; do not parse it. `msSinceLast` is the elapsed
+   * milliseconds since the previous mumble call on this instance, or
+   * 0 for the first call of a turn.
+   *
+   * Pass `undefined` to disable. Setting mid-turn takes effect on the
+   * next incoming frame.
+   */
+  setMumble(cb: MumbleCallback | undefined): void;
 }
 
 /**
